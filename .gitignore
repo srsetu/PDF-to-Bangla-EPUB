@@ -1,0 +1,14 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+server_keys.json
+*.key
+*.pem
+*.local
+temp/
+

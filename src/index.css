@@ -1,0 +1,418 @@
+@import "tailwindcss";
+
+@variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    color-scheme: light dark;
+  }
+
+  html,
+  body {
+    height: 100%;
+    height: 100dvh;
+    max-height: 100dvh;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    overscroll-behavior: none;
+    font-family: 'Hind Siliguri', system-ui, -apple-system, sans-serif;
+    color: #0f172a;
+    background-color: #f8fafc;
+    transition: background-color 0.2s ease, color 0.2s ease;
+  }
+
+  #root {
+    height: 100%;
+    height: 100dvh;
+    max-height: 100dvh;
+    overflow: hidden;
+  }
+
+  html.dark body {
+    color: #f8fafc;
+    background-color: #090d16;
+  }
+
+  /* High-contrast and easily readable placeholders in both light and dark mode */
+  ::placeholder {
+    color: #94a3b8; /* slate-400 */
+    opacity: 1;
+  }
+
+  html.dark ::placeholder,
+  html.dark input::placeholder,
+  html.dark textarea::placeholder {
+    color: #94a3b8 !important; /* crisp, high-visibility slate-400 */
+    opacity: 1 !important;
+  }
+
+  /* Automatic dark mode baseline for input fields, textareas, and selects */
+  html.dark input[type="text"],
+  html.dark input[type="number"],
+  html.dark input[type="search"],
+  html.dark textarea,
+  html.dark select {
+    background-color: #0f172a;
+    color: #f8fafc;
+    border-color: #334155;
+  }
+
+  html.dark input[type="text"]:focus,
+  html.dark input[type="number"]:focus,
+  html.dark input[type="search"]:focus,
+  html.dark textarea:focus,
+  html.dark select:focus {
+    border-color: #6366f1;
+    outline: none;
+  }
+}
+
+/* Custom scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+.dark ::-webkit-scrollbar-track {
+  background: #0f172a;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+.dark ::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
+
+/* Scanning radar / laser line animation */
+@keyframes scanline {
+  0% {
+    top: 0%;
+    opacity: 0.8;
+  }
+  50% {
+    opacity: 1;
+  }
+  100% {
+    top: 98%;
+    opacity: 0.8;
+  }
+}
+
+.animate-scan {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: linear-gradient(90deg, rgba(99, 102, 241, 0) 0%, rgba(99, 102, 241, 0.9) 50%, rgba(99, 102, 241, 0) 100%);
+  box-shadow: 0 0 12px 3px rgba(99, 102, 241, 0.6);
+  animation: scanline 2.2s ease-in-out infinite alternate;
+}
+
+/* Bengali Book Reader Alignment & Basic Indentation */
+.text-center,
+.prose .text-center,
+.prose p.text-center,
+.prose div.text-center,
+.prose h1.text-center,
+.prose h2.text-center,
+.prose h3.text-center {
+  text-align: center !important;
+  text-indent: 0 !important;
+}
+
+.text-left,
+.prose .text-left,
+.prose p.text-left,
+.prose div.text-left {
+  text-align: left !important;
+}
+
+.text-right,
+.prose .text-right,
+.prose p.text-right,
+.prose div.text-right {
+  text-align: right !important;
+  text-indent: 0 !important;
+}
+
+.text-justify,
+.prose .text-justify,
+.prose p.text-justify,
+.prose div.text-justify {
+  text-align: justify !important;
+}
+
+.no-indent,
+.prose .no-indent,
+.prose p.no-indent {
+  text-indent: 0 !important;
+}
+
+.indent-1,
+.prose .indent-1,
+.prose p.indent-1 {
+  text-indent: 2.2em !important;
+}
+
+.indent-2,
+.prose .indent-2,
+.prose p.indent-2 {
+  text-indent: 4em !important;
+}
+
+.indent-line,
+.prose .indent-line,
+.prose p.indent-line {
+  margin-left: 2em !important;
+  text-indent: 0 !important;
+}
+
+.indent-block,
+.prose .indent-block,
+.prose div.indent-block {
+  margin-left: 2.5em !important;
+  margin-right: 1.5em !important;
+  text-indent: 0 !important;
+}
+
+.section-divider,
+.prose .section-divider {
+  text-align: center !important;
+  text-indent: 0 !important;
+  letter-spacing: 0.35em !important;
+  margin: 1.6em 0 !important;
+  font-weight: bold !important;
+  color: #64748b;
+}
+
+/* Stanzas / Poetry lines */
+.bengali-quote,
+.prose blockquote.bengali-quote {
+  margin: 1.2em 1.5em;
+  padding: 0.6em 1.2em;
+  border-left: 4px solid #6366f1;
+  background-color: rgba(99, 102, 241, 0.05);
+  font-style: italic;
+  border-radius: 4px;
+}
+
+.prose .quote-line {
+  margin-bottom: 0.3em;
+  text-indent: 0 !important;
+}
+
+/* Figure alignment based on PDF positioning */
+.fig-left,
+.prose .fig-left,
+.prose figure.fig-left {
+  text-align: left !important;
+  margin-right: auto !important;
+}
+
+.fig-center,
+.prose .fig-center,
+.prose figure.fig-center {
+  text-align: center !important;
+  margin-left: auto !important;
+  margin-right: auto !important;
+}
+
+.fig-right,
+.prose .fig-right,
+.prose figure.fig-right {
+  text-align: right !important;
+  margin-left: auto !important;
+}
+
+/* Table of Contents (সূচিপত্র) Interactive Styles */
+.toc-container,
+.prose .toc-container {
+  margin: 1.5em 0;
+  padding: 0;
+}
+
+.toc-heading,
+.prose .toc-heading {
+  font-size: 1.5em !important;
+  font-weight: 700 !important;
+  text-align: center !important;
+  margin-top: 0.5em !important;
+  margin-bottom: 1.2em !important;
+  color: #1e293b !important;
+  border-bottom: 2px solid #e2e8f0;
+  padding-bottom: 0.5em;
+}
+
+.dark .toc-heading,
+.dark .prose .toc-heading {
+  color: #f8fafc !important;
+  border-bottom-color: #334155;
+}
+
+.toc-divider,
+.prose .toc-divider {
+  border: none !important;
+  border-top: 1px dashed #cbd5e1 !important;
+  margin: 1em 0 !important;
+}
+
+.dark .toc-divider,
+.dark .prose .toc-divider {
+  border-top-color: #334155 !important;
+}
+
+.toc-list,
+.prose .toc-list {
+  list-style: none !important;
+  padding: 0 !important;
+  margin: 0 !important;
+}
+
+.toc-entry,
+.prose .toc-entry {
+  list-style: none !important;
+  margin: 0.8em 0 !important;
+  padding: 0 !important;
+  text-indent: 0 !important;
+}
+
+.toc-link,
+.prose .toc-link {
+  display: flex !important;
+  align-items: baseline !important;
+  justify-content: space-between !important;
+  text-decoration: none !important;
+  color: #1e293b !important;
+  font-weight: 500;
+  border-radius: 8px;
+  padding: 0.35em 0.6em;
+  transition: all 0.15s ease;
+  cursor: pointer;
+  background-color: transparent;
+}
+
+.toc-link:hover,
+.prose .toc-link:hover {
+  color: #4f46e5 !important;
+  background-color: rgba(99, 102, 241, 0.08);
+  transform: translateX(2px);
+}
+
+.dark .toc-link,
+.dark .prose .toc-link {
+  color: #f1f5f9 !important;
+}
+
+.dark .toc-link:hover,
+.dark .prose .toc-link:hover {
+  color: #818cf8 !important;
+  background-color: rgba(99, 102, 241, 0.2);
+}
+
+.toc-title,
+.prose .toc-title {
+  flex-shrink: 0;
+  max-width: 80%;
+  color: inherit;
+  font-weight: inherit;
+}
+
+.toc-dots,
+.prose .toc-dots {
+  flex-grow: 1;
+  border-bottom: 1.5px dotted #94a3b8;
+  margin: 0 0.6em;
+  min-width: 1.5em;
+  height: 0.7em;
+}
+
+.dark .toc-dots,
+.dark .prose .toc-dots {
+  border-bottom-color: #475569;
+}
+
+.toc-page,
+.prose .toc-page {
+  flex-shrink: 0;
+  font-weight: 700;
+  color: #4f46e5 !important;
+  font-size: 0.95em;
+}
+
+.dark .toc-page,
+.dark .prose .toc-page {
+  color: #818cf8 !important;
+}
+
+.toc-notice,
+.prose .toc-notice {
+  margin-top: 2em;
+  font-size: 0.85em;
+  color: #64748b;
+  font-style: italic;
+  text-align: center;
+  border-top: 1px solid #e2e8f0;
+  padding-top: 1em;
+}
+
+.dark .toc-notice,
+.dark .prose .toc-notice {
+  color: #94a3b8;
+  border-top-color: #334155;
+}
+
+/* Mobile & Touch Responsiveness Utilities */
+@layer utilities {
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  .pb-safe {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  .pt-safe {
+    padding-top: env(safe-area-inset-top, 0px);
+  }
+  .pl-safe {
+    padding-left: env(safe-area-inset-left, 0px);
+  }
+  .pr-safe {
+    padding-right: env(safe-area-inset-right, 0px);
+  }
+}
+
+/* Prevent unwanted zoom on iOS form fields by maintaining 16px baseline on small screens */
+@media (max-width: 640px) {
+  input:not([type="checkbox"]):not([type="radio"]),
+  select,
+  textarea {
+    font-size: 16px !important;
+  }
+}
+
+/* Ensure smooth momentum scrolling on touch devices */
+.overflow-y-auto,
+.overflow-x-auto {
+  -webkit-overflow-scrolling: touch;
+}
+
+* {
+  -webkit-tap-highlight-color: transparent;
+}
+
+

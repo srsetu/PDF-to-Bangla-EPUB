@@ -1,0 +1,8 @@
+{
+  "name": "Refined বাংলা পিডিএফ থেকে ইপাব কনভার্টার (Bangla PDF to EPUB)",
+  "description": "গুগল জেমিনাই ভিশন এআই দিয়ে যেকোনো বাংলা পিডিএফ বইকে নিখুঁত ইপাব (EPUB) ফরম্যাটে রূপান্তর করার আধুনিক টুল।",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

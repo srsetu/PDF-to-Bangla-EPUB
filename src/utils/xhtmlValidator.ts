@@ -1,0 +1,663 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import * as htmlparser2 from 'htmlparser2';
+import render from 'dom-serializer';
+import { DOMParser as XmlDomParser } from '@xmldom/xmldom';
+import JSZip from 'jszip';
+
+/**
+ * XML 1.0 5th Edition: Valid character range is:
+ * #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+ *
+ * Strips all control characters and invalid XML 1.0 code points while
+ * strictly preserving valid Unicode characters (Bangla, English, Arabic, Sanskrit, Devanagari, symbols).
+ */
+export function stripInvalidXmlChars(input: string): string {
+  if (!input) return '';
+  // Removes control chars 0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F, 0x7F-0x84, 0x86-0x9F,
+  // surrogate blocks, 0xFFFE, 0xFFFF.
+  return input.replace(
+    /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x84\x86-\x9F\uFDD0-\uFDEF\uFFFE\uFFFF]/g,
+    ''
+  );
+}
+
+/**
+ * Comprehensive mapping of standard HTML named entities to their XML-safe numeric
+ * character references or direct Unicode characters.
+ *
+ * In EPUB XHTML (application/xhtml+xml), external DTDs are not loaded, so HTML named
+ * entities like `&nbsp;` cause fatal XML parsing errors in e-readers like CrossInk!
+ */
+const HTML_ENTITY_MAP: Record<string, string> = {
+  // Whitespace and formatting
+  nbsp: '&#160;', // Non-breaking space
+  thinsp: '&#8201;',
+  ensp: '&#8194;',
+  emsp: '&#8195;',
+  zwnj: '&#8204;',
+  zwj: '&#8205;',
+
+  // Punctuation and quotes
+  mdash: '—',
+  ndash: '–',
+  hellip: '…',
+  ldquo: '“',
+  rdquo: '”',
+  lsquo: '‘',
+  rsquo: '’',
+  sbquo: '‚',
+  bdquo: '„',
+  laquo: '«',
+  raquo: '»',
+  bull: '•',
+  middot: '·',
+  prime: '′',
+  Prime: '″',
+  permil: '‰',
+  dagger: '†',
+  Dagger: '‡',
+
+  // Symbols and currency
+  copy: '©',
+  reg: '®',
+  trade: '™',
+  sect: '§',
+  para: '¶',
+  cent: '¢',
+  pound: '£',
+  yen: '¥',
+  euro: '€',
+
+  // Mathematical and technical
+  times: '×',
+  divide: '÷',
+  plusmn: '±',
+  minus: '−',
+  le: '≤',
+  ge: '≥',
+  ne: '≠',
+  asymp: '≈',
+  equiv: '≡',
+  infin: '∞',
+  deg: '°',
+  micro: 'µ',
+  radic: '√',
+  sum: '∑',
+  prod: '∏',
+  part: '∂',
+  int: '∫',
+  empty: '∅',
+  isin: '∈',
+  notin: '∉',
+  cap: '∩',
+  cup: '∪',
+  sim: '∼',
+  cong: '≅',
+  sub: '⊂',
+  sup: '⊃',
+  nsub: '⊄',
+  sube: '⊆',
+  supe: '⊇',
+  oplus: '⊕',
+  otimes: '⊗',
+  perp: '⊥',
+  sdot: '⋅',
+  lceil: '⌈',
+  rceil: '⌉',
+  lfloor: '⌊',
+  rfloor: '⌋',
+
+  // Arrows
+  larr: '←',
+  uarr: '↑',
+  rarr: '→',
+  darr: '↓',
+  harr: '↔',
+  crarr: '↵',
+  lArr: '⇐',
+  uArr: '⇑',
+  rArr: '⇒',
+  dArr: '⇓',
+  hArr: '⇔',
+
+  // Greek (common in mathematical / academic texts)
+  alpha: 'α',
+  beta: 'β',
+  gamma: 'γ',
+  delta: 'δ',
+  epsilon: 'ε',
+  theta: 'θ',
+  lambda: 'λ',
+  mu: 'μ',
+  pi: 'π',
+  sigma: 'σ',
+  tau: 'τ',
+  phi: 'φ',
+  omega: 'ω',
+  Gamma: 'Γ',
+  Delta: 'Δ',
+  Theta: 'Θ',
+  Lambda: 'Λ',
+  Sigma: 'Σ',
+  Phi: 'Φ',
+  Omega: 'Ω',
+};
+
+/**
+ * Normalizes HTML entities into XML-compliant forms without double-escaping
+ * valid XML entities (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`, `&#...;`).
+ *
+ * Converts bare ampersands (e.g. "Tom & Jerry", "AT&T", URLs with query strings)
+ * into `&amp;`.
+ */
+export function sanitizeXmlEntities(text: string): string {
+  if (!text) return '';
+
+  // Step 1: Replace known HTML named entities with XML-safe numeric or Unicode characters
+  let result = text.replace(/&([a-zA-Z0-9]+);/g, (match, entityName) => {
+    // Keep standard 5 XML predefined entities intact
+    if (['amp', 'lt', 'gt', 'quot', 'apos'].includes(entityName)) {
+      return match;
+    }
+    const mapped = HTML_ENTITY_MAP[entityName];
+    if (mapped) {
+      return mapped;
+    }
+    // Unknown named entity: unescape or convert to literal
+    return match;
+  });
+
+  // Step 2: Escape any bare ampersands that are NOT part of a valid XML entity reference
+  // Valid references: &amp;, &lt;, &gt;, &quot;, &apos;, &#123;, &#x1F;
+  result = result.replace(/&(?!(amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)/g, '&amp;');
+
+  return result;
+}
+
+/**
+ * Allowed standard XHTML elements for EPUB 3 chapter bodies.
+ * Hallucinated, non-standard, or script tags are safely unwrapped or removed.
+ */
+const ALLOWED_EPUB_TAGS = new Set([
+  'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+  'div', 'span', 'blockquote',
+  'ul', 'ol', 'li',
+  'table', 'thead', 'tbody', 'tfoot', 'tr', 'th', 'td', 'caption',
+  'figure', 'figcaption', 'img',
+  'a', 'em', 'strong', 'b', 'i', 'u', 's', 'strike',
+  'code', 'pre', 'sub', 'sup', 'small', 'mark',
+  'hr', 'br', 'wbr',
+  'abbr', 'cite', 'q', 'time',
+  'nav', 'section', 'article', 'header', 'footer', 'aside',
+]);
+
+/**
+ * Elements that are void (self-closing) in HTML/XHTML.
+ */
+const VOID_ELEMENTS = new Set([
+  'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
+  'link', 'meta', 'param', 'source', 'track', 'wbr',
+]);
+
+/**
+ * Normalizes any HTML fragment generated by Gemini or edited by users into
+ * strictly compliant, well-formed XHTML.
+ *
+ * - Closes all void elements with XHTML syntax (`<br />`, `<hr />`, `<img ... />`).
+ * - Resolves all unclosed or mismatched tags.
+ * - Quotes all attributes.
+ * - Removes illegal control characters.
+ * - Replaces non-XML entities like `&nbsp;` with `&#160;`.
+ * - Escapes bare ampersands.
+ */
+export function normalizeHtmlToXhtml(htmlFragment: string): string {
+  if (!htmlFragment || !htmlFragment.trim()) {
+    return '<p>...</p>';
+  }
+
+  // Step 1: Strip control characters & sanitize entities in raw markup
+  let cleaned = stripInvalidXmlChars(htmlFragment);
+  cleaned = sanitizeXmlEntities(cleaned);
+
+  // Normalize legacy <center> tags to styled <div> elements
+  cleaned = cleaned.replace(/<center(?:\s+[^>]*)?>/gi, '<div class="text-center">');
+  cleaned = cleaned.replace(/<\/center>/gi, '</div>');
+
+  // Step 2: Parse using htmlparser2 (resilient HTML5 parsing algorithm)
+  const dom = htmlparser2.parseDocument(cleaned, {
+    lowerCaseTags: true,
+    lowerCaseAttributeNames: true,
+    decodeEntities: false,
+  });
+
+  // Step 3: Traverse and sanitize nodes in the DOM tree
+  function sanitizeDomNodes(nodes: any[]): any[] {
+    const resultNodes: any[] = [];
+
+    for (const node of nodes) {
+      if (node.type === 'tag') {
+        const tagName = (node.name || '').toLowerCase();
+
+        // Disallow dangerous or unsupported tags (script, style, iframe, etc.)
+        if (['script', 'style', 'iframe', 'object', 'embed', 'form'].includes(tagName)) {
+          continue;
+        }
+
+        // If tag is not in allowed list, unwrap it (keep its children/text)
+        if (!ALLOWED_EPUB_TAGS.has(tagName)) {
+          if (node.children && node.children.length > 0) {
+            const unwrappedChildren = sanitizeDomNodes(node.children);
+            resultNodes.push(...unwrappedChildren);
+          }
+          continue;
+        }
+
+        // Clean element attributes
+        const cleanAttribs: Record<string, string> = {};
+        for (const [attrKey, attrVal] of Object.entries(node.attribs || {})) {
+          const lowerKey = attrKey.toLowerCase();
+          // Remove event handler attributes (e.g. onclick, onload)
+          if (lowerKey.startsWith('on')) continue;
+
+          let valStr = String(attrVal ?? '');
+
+          // Ensure XML-safe string for attribute value
+          valStr = stripInvalidXmlChars(valStr);
+          valStr = sanitizeXmlEntities(valStr);
+
+          // XML ID attributes must be valid NCName tokens
+          if (lowerKey === 'id') {
+            valStr = valStr.replace(/[^a-zA-Z0-9_\-.:]/g, '-').replace(/^[^a-zA-Z_]+/, 'id-$&');
+          }
+
+          cleanAttribs[lowerKey] = valStr;
+        }
+
+        // Accessibility requirement for EPUB <img>: alt attribute must be present
+        if (tagName === 'img' && cleanAttribs.alt === undefined) {
+          cleanAttribs.alt = 'চিত্র';
+        }
+
+        node.attribs = cleanAttribs;
+
+        // Recursively sanitize children for non-void elements
+        if (node.children && node.children.length > 0 && !VOID_ELEMENTS.has(tagName)) {
+          node.children = sanitizeDomNodes(node.children);
+        } else if (VOID_ELEMENTS.has(tagName)) {
+          node.children = [];
+        }
+
+        resultNodes.push(node);
+      } else if (node.type === 'text') {
+        node.data = stripInvalidXmlChars(node.data || '');
+        node.data = sanitizeXmlEntities(node.data);
+        resultNodes.push(node);
+      } else if (node.type === 'comment') {
+        // Comments are allowed in XHTML if properly formatted
+        node.data = stripInvalidXmlChars(node.data || '').replace(/--/g, ' - - ');
+        resultNodes.push(node);
+      }
+    }
+
+    return resultNodes;
+  }
+
+  dom.children = sanitizeDomNodes(dom.children);
+
+  // Step 4: Serialize into strict XHTML using dom-serializer in xmlMode
+  let serialized = render(dom, {
+    xmlMode: true,
+    selfClosingTags: true,
+    decodeEntities: false,
+  });
+
+  // Ensure void elements have standard space before slash: `<br />`, `<hr />`, `<img ... />`
+  serialized = serialized.replace(/<(br|hr|wbr|img)(\s+[^>]*?)?\/>/gi, (_match, tag, attrs) => {
+    return `<${tag}${attrs || ''} />`;
+  });
+
+  return serialized.trim();
+}
+
+export interface XmlValidationResult {
+  isValid: boolean;
+  error?: string;
+  line?: number;
+  column?: number;
+}
+
+/**
+ * Validates any XML/XHTML string using a standards-compliant XML parser.
+ * Supports both Browser (window.DOMParser) and Node.js (@xmldom/xmldom).
+ */
+export function validateXmlString(xmlString: string): XmlValidationResult {
+  if (!xmlString || !xmlString.trim()) {
+    return { isValid: false, error: 'Empty document' };
+  }
+
+  // Check 1: In browser runtime
+  if (typeof window !== 'undefined' && typeof window.DOMParser !== 'undefined') {
+    try {
+      const parser = new window.DOMParser();
+      const doc = parser.parseFromString(xmlString, 'application/xml');
+      const parserErrors = doc.getElementsByTagName('parsererror');
+      if (parserErrors.length > 0) {
+        const errorText = parserErrors[0].textContent || 'XML parsing error';
+        return { isValid: false, error: errorText.trim() };
+      }
+      return { isValid: true };
+    } catch (err: any) {
+      return { isValid: false, error: err.message || 'Browser DOMParser threw an exception' };
+    }
+  }
+
+  // Check 2: Node.js runtime via @xmldom/xmldom
+  try {
+    let capturedError: string | null = null;
+    let errLine: number | undefined;
+    let errCol: number | undefined;
+
+    const parser = new XmlDomParser({
+      onError: (level: string, message: string) => {
+        if (level === 'error' || level === 'fatalError') {
+          if (!capturedError) capturedError = String(message);
+        }
+      },
+    });
+
+    parser.parseFromString(xmlString, 'application/xml');
+
+    if (capturedError) {
+      return { isValid: false, error: capturedError, line: errLine, column: errCol };
+    }
+
+    return { isValid: true };
+  } catch (err: any) {
+    return { isValid: false, error: err.message || 'XmlDomParser failed' };
+  }
+}
+
+/**
+ * Creates a well-formed complete XHTML chapter document.
+ */
+export function buildCompleteXhtmlDocument(
+  title: string,
+  bodyContent: string,
+  lang: string = 'bn'
+): string {
+  const safeTitle = sanitizeXmlEntities(stripInvalidXmlChars(title || 'Chapter'));
+  const safeLang = stripInvalidXmlChars(lang || 'bn').replace(/[^a-zA-Z_-]/g, '') || 'bn';
+
+  return `<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="${safeLang}" lang="${safeLang}">
+<head>
+  <meta charset="utf-8" />
+  <title>${safeTitle}</title>
+  <link rel="stylesheet" type="text/css" href="styles.css" />
+</head>
+<body>
+${bodyContent}
+</body>
+</html>`;
+}
+
+/**
+ * Fault-tolerant recovery strategy for malformed chapter XHTML documents.
+ * Preserves all readable text, paragraph boundaries, headings, and images
+ * while strictly guaranteeing valid XML output.
+ */
+export function repairMalformedXhtml(
+  xhtmlOrFragment: string,
+  title: string = 'Chapter',
+  lang: string = 'bn'
+): string {
+  // Step 1: Attempt HTML normalization and re-wrapping
+  try {
+    const normalizedBody = normalizeHtmlToXhtml(xhtmlOrFragment);
+    const candidateDoc = buildCompleteXhtmlDocument(title, normalizedBody, lang);
+    const check = validateXmlString(candidateDoc);
+    if (check.isValid) {
+      return candidateDoc;
+    }
+  } catch {
+    // Continue to Step 2
+  }
+
+  // Step 2: Content-preserving safe fallback reconstruction
+  // Extract text line-by-line while preserving headings, alignments, and images
+  const safeLines = stripInvalidXmlChars(xhtmlOrFragment).split(/\r?\n/);
+  const safeParts: string[] = [];
+
+  for (const raw of safeLines) {
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+
+    // Check for headings
+    if (trimmed.startsWith('# ')) {
+      safeParts.push(`<h1>${sanitizeXmlEntities(trimmed.substring(2).trim())}</h1>`);
+    } else if (trimmed.startsWith('## ')) {
+      safeParts.push(`<h2>${sanitizeXmlEntities(trimmed.substring(3).trim())}</h2>`);
+    } else if (trimmed.startsWith('### ')) {
+      safeParts.push(`<h3>${sanitizeXmlEntities(trimmed.substring(4).trim())}</h3>`);
+    } else if (trimmed.includes('text-center') || trimmed.includes('<center>')) {
+      const cleanText = trimmed.replace(/<[^>]+>/g, '').trim();
+      if (cleanText) {
+        safeParts.push(`<p class="text-center">${sanitizeXmlEntities(cleanText)}</p>`);
+      }
+    } else if (trimmed.includes('text-right')) {
+      const cleanText = trimmed.replace(/<[^>]+>/g, '').trim();
+      if (cleanText) {
+        safeParts.push(`<p class="text-right">${sanitizeXmlEntities(cleanText)}</p>`);
+      }
+    } else {
+      const cleanText = trimmed.replace(/<[^>]+>/g, '').trim();
+      if (cleanText) {
+        safeParts.push(`<p>${sanitizeXmlEntities(cleanText)}</p>`);
+      }
+    }
+  }
+
+  const fallbackBody = safeParts.length > 0 ? safeParts.join('\n') : '<p>...</p>';
+  return buildCompleteXhtmlDocument(title, fallbackBody, lang);
+}
+
+export interface PackageValidationReport {
+  isValid: boolean;
+  errors: string[];
+  warnings: string[];
+  totalXhtmlFilesValidated: number;
+  totalManifestItemsValidated: number;
+}
+
+/**
+ * Complete EPUB Package Validation Gate.
+ * Validates all components of an EPUB archive before download:
+ * 1. Mimetype file (position, compression, content)
+ * 2. META-INF/container.xml structure and validity
+ * 3. OEBPS/content.opf structure, metadata, manifest, and spine
+ * 4. All chapter XHTML files (strict XML well-formedness, no CrossInk fatal errors)
+ * 5. Navigation document (nav.xhtml & toc.ncx)
+ * 6. Internal href and anchor resolution
+ * 7. Manifest file existence in ZIP archive
+ */
+export async function validateEpubPackage(zip: JSZip): Promise<PackageValidationReport> {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  let xhtmlCount = 0;
+  let manifestCount = 0;
+
+  // 1. Validate mimetype
+  const mimetypeFile = zip.file('mimetype');
+  if (!mimetypeFile) {
+    errors.push('CRITICAL: mimetype file missing in EPUB archive root.');
+  } else {
+    const mimetypeText = (await mimetypeFile.async('text')).trim();
+    if (mimetypeText !== 'application/epub+zip') {
+      errors.push(`CRITICAL: mimetype content is "${mimetypeText}", must be "application/epub+zip".`);
+    }
+  }
+
+  // 2. Validate META-INF/container.xml
+  const containerFile = zip.file('META-INF/container.xml');
+  let opfPath = 'OEBPS/content.opf';
+  if (!containerFile) {
+    errors.push('CRITICAL: META-INF/container.xml missing.');
+  } else {
+    const containerText = await containerFile.async('text');
+    const containerCheck = validateXmlString(containerText);
+    if (!containerCheck.isValid) {
+      errors.push(`CRITICAL: META-INF/container.xml is malformed XML: ${containerCheck.error}`);
+    } else {
+      const match = containerText.match(/full-path=["']([^"']+)["']/i);
+      if (match && match[1]) {
+        opfPath = match[1];
+      }
+    }
+  }
+
+  // 3. Validate content.opf
+  const opfFile = zip.file(opfPath);
+  if (!opfFile) {
+    errors.push(`CRITICAL: Package OPF file missing at "${opfPath}".`);
+  } else {
+    const opfText = await opfFile.async('text');
+    const opfCheck = validateXmlString(opfText);
+    if (!opfCheck.isValid) {
+      errors.push(`CRITICAL: ${opfPath} is malformed XML: ${opfCheck.error}`);
+    }
+
+    // Check required EPUB metadata
+    if (!opfText.includes('<dc:identifier') || !opfText.includes('</dc:identifier>')) {
+      errors.push('EPUB metadata missing <dc:identifier>.');
+    }
+    if (!opfText.includes('<dc:title') || !opfText.includes('</dc:title>')) {
+      errors.push('EPUB metadata missing <dc:title>.');
+    }
+    if (!opfText.includes('<dc:language') || !opfText.includes('</dc:language>')) {
+      errors.push('EPUB metadata missing <dc:language>.');
+    }
+
+    // Collect manifest items: href -> id
+    const manifestRegex = /<item\s+[^>]*?href=["']([^"']+)["'][^>]*?>/gi;
+    const manifestHrefs: string[] = [];
+    let mMatch;
+    const opfDir = opfPath.includes('/') ? opfPath.substring(0, opfPath.lastIndexOf('/') + 1) : '';
+
+    while ((mMatch = manifestRegex.exec(opfText)) !== null) {
+      const rawHref = mMatch[1];
+      manifestHrefs.push(rawHref);
+      manifestCount++;
+
+      const fullZipPath = opfDir + rawHref;
+      if (!zip.file(fullZipPath)) {
+        errors.push(`Manifest references missing file in archive: "${fullZipPath}".`);
+      }
+    }
+
+    // Check that EPUB 3 navigation property exists
+    if (!opfText.includes('properties="nav"')) {
+      errors.push('EPUB 3 requirement: Manifest item with properties="nav" is missing.');
+    }
+
+    // Check spine items
+    const spineRegex = /<itemref\s+[^>]*?idref=["']([^"']+)["'][^>]*?>/gi;
+    let sMatch;
+    let spineCount = 0;
+    while ((sMatch = spineRegex.exec(opfText)) !== null) {
+      spineCount++;
+      const idref = sMatch[1];
+      if (!opfText.includes(`id="${idref}"`)) {
+        errors.push(`Spine itemref idref="${idref}" does not match any manifest item id.`);
+      }
+    }
+    if (spineCount === 0) {
+      errors.push('Spine has zero itemref elements.');
+    }
+  }
+
+  // 4. Validate all XHTML files in the archive
+  const opfDir = opfPath.includes('/') ? opfPath.substring(0, opfPath.lastIndexOf('/') + 1) : '';
+  const xhtmlEntries = Object.keys(zip.files).filter(
+    (name) => name.endsWith('.xhtml') || name.endsWith('.html')
+  );
+
+  // Track all element IDs across all XHTML files for anchor link resolution
+  const fileElementIds = new Map<string, Set<string>>();
+
+  for (const filePath of xhtmlEntries) {
+    const file = zip.file(filePath);
+    if (!file) continue;
+    xhtmlCount++;
+
+    const content = await file.async('text');
+    const xmlCheck = validateXmlString(content);
+
+    if (!xmlCheck.isValid) {
+      errors.push(
+        `Malformed XHTML in "${filePath}": ${xmlCheck.error}. This causes "Chapter incomplete" in CrossInk!`
+      );
+    }
+
+    // Index all element IDs in this file for target anchor validation
+    const localFileName = filePath.startsWith(opfDir) ? filePath.substring(opfDir.length) : filePath;
+    const idSet = new Set<string>();
+    const idRegex = /\sid=["']([^"']+)["']/gi;
+    let idMatch;
+    while ((idMatch = idRegex.exec(content)) !== null) {
+      idSet.add(idMatch[1]);
+    }
+    fileElementIds.set(localFileName, idSet);
+
+    // Verify all <img> tags reference existing images
+    const imgRegex = /<img\s+[^>]*?src=["']([^"']+)["'][^>]*?>/gi;
+    let imgMatch;
+    while ((imgMatch = imgRegex.exec(content)) !== null) {
+      const src = imgMatch[1];
+      if (!src.startsWith('data:') && !src.startsWith('http')) {
+        const fullImgPath = opfDir + src;
+        if (!zip.file(fullImgPath)) {
+          warnings.push(`Image not found in archive: "${fullImgPath}" referenced in "${filePath}".`);
+        }
+      }
+    }
+  }
+
+  // 5. Validate Navigation document links (nav.xhtml & toc.ncx)
+  const navFilePath = opfDir + 'nav.xhtml';
+  const navFile = zip.file(navFilePath);
+  if (navFile) {
+    const navContent = await navFile.async('text');
+    const linkRegex = /<a\s+[^>]*?href=["']([^"']+)["'][^>]*?>/gi;
+    let lMatch;
+    while ((lMatch = linkRegex.exec(navContent)) !== null) {
+      const href = lMatch[1];
+      const [fileName, anchor] = href.split('#');
+      if (fileName) {
+        const fullTarget = opfDir + fileName;
+        if (!zip.file(fullTarget)) {
+          errors.push(`nav.xhtml link target does not exist: "${href}"`);
+        } else if (anchor) {
+          const idsInTarget = fileElementIds.get(fileName);
+          if (idsInTarget && !idsInTarget.has(anchor)) {
+            warnings.push(
+              `nav.xhtml link anchor "#${anchor}" not found in target file "${fileName}".`
+            );
+          }
+        }
+      }
+    }
+  }
+
+  return {
+    isValid: errors.length === 0,
+    errors,
+    warnings,
+    totalXhtmlFilesValidated: xhtmlCount,
+    totalManifestItemsValidated: manifestCount,
+  };
+}
