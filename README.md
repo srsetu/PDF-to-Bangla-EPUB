@@ -79,3 +79,69 @@
     ├── epubValidationRegression.test.ts # XHTML well-formedness & CrossInk compatibility tests
     ├── tocExtraction.test.ts            # 12-scenario TOC extraction & navigation verification suite
     └── imageExtraction.test.ts          # 10-scenario PDF CTM matrix & figure extraction test suite
+```
+
+---
+
+## 🚀 Getting Started
+
+### Prerequisites
+- **Node.js** `v20+` (or **Bun** `v1.1+`)
+- A **Gemini API Key** configured in `.env`
+
+### Installation
+
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/your-username/bangla-epub-studio.git
+   cd bangla-epub-studio
+   ```
+
+2. **Install dependencies**
+   ```bash
+   npm install
+   ```
+
+3. **Configure environment variables**
+   Copy `.env.example` to `.env` and add your API key(s):
+   ```bash
+   cp .env.example .env
+   ```
+   ```env
+   GEMINI_API_KEY="YOUR_API_KEY"
+   # Optional: comma-separated keys for higher RPM throughput
+   GEMINI_API_KEYS="KEY_1,KEY_2,KEY_3"
+   ```
+
+4. **Start the development server**
+   ```bash
+   npm run dev
+   ```
+   Open `http://localhost:3000` in your browser.
+
+5. **Build for production**
+   ```bash
+   npm run build
+   npm start
+   ```
+
+---
+
+## 🧪 Running the Test Suites
+
+The project includes 5 automated verification and regression suites covering Bengali OCR validation, layout reconstruction, TOC extraction, image cropping geometry, and strict EPUB 3 XML validation:
+
+```bash
+# Run all test suites
+npx tsx tests/epubLayoutReconstruction.test.ts && \
+npx tsx tests/bengaliOcrValidation.test.ts && \
+npx tsx tests/epubValidationRegression.test.ts && \
+npx tsx tests/tocExtraction.test.ts && \
+npx tsx tests/imageExtraction.test.ts
+```
+
+---
+
+## 📄 License
+
+Distributed under the **Apache-2.0 License**.

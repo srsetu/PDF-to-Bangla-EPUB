@@ -34,6 +34,7 @@ export interface ConversionSettings {
   language: LanguageOption;
   batchSize: number; // 1 to 5
   mode: ExtractionMode;
+  smartSpacing?: boolean; // Default true (Smart Spacing: ON)
 }
 
 export interface PageFigure {
@@ -113,24 +114,65 @@ export interface PdfTextBlock {
   width: number;
   height: number;
   fontSize?: number;
+  fontName?: string;
   pageNumber?: number;
   columnIndex?: number;
 }
 
 export type ContinuationConfidence = 'high' | 'medium' | 'low' | 'none';
 
+export type ReconstructionConfidenceLevel = 'HIGH' | 'MEDIUM' | 'LOW';
+
+export type SmartSpacingBoundaryClassification =
+  | 'SAME_PARAGRAPH'
+  | 'NEW_PARAGRAPH'
+  | 'NEW_HEADING'
+  | 'NEW_CHAPTER'
+  | 'STRUCTURED_CONTENT'
+  | 'UNCERTAIN';
+
+export type BoundaryDecisionType =
+  | 'SAFE_TO_MERGE'
+  | 'SAFE_TO_SEPARATE'
+  | 'UNCERTAIN';
+
+export interface BoundaryReconstructionDiagnostic {
+  originalBoundaryText: string;
+  proposedReconstruction: string;
+  finalDecision:
+    | 'RECONSTRUCTED_WORD_AND_MERGED'
+    | 'MERGED_PARAGRAPH_ONLY'
+    | 'PRESERVED_SEPARATE_BLOCKS'
+    | 'FLAGGED_UNCERTAIN_PRESERVED';
+  confidenceLevel: ReconstructionConfidenceLevel;
+  confidenceScore: number;
+  scoreBreakdown: Record<string, number>;
+  reason: string;
+  evidenceUsed: string[];
+  visualVerificationPerformed: boolean;
+}
+
 export interface PageBoundaryMergeDecision {
   fromPage: number;
   toPage: number;
+  classification?: SmartSpacingBoundaryClassification;
+  boundaryDecision?: BoundaryDecisionType;
   shouldMergeParagraph: boolean;
   shouldConsolidateSection: boolean;
+  removeVisualPageGap?: boolean;
+  joinSplitWord?: boolean;
+  preservedOriginalFragment?: boolean;
   confidence: ContinuationConfidence;
+  confidenceLevel?: ReconstructionConfidenceLevel;
   score: number;
+  scoreBreakdown?: Record<string, number>;
   signals: string[];
   nonMergeReason?: string;
+  diagnostics?: BoundaryReconstructionDiagnostic;
 }
 
 export interface LayoutCleanupReport {
+  smartSpacingEnabled?: boolean;
   totalInputPages: number;
   totalOutputSections: number;
   multiColumnPagesReordered: number;
@@ -141,6 +183,13 @@ export interface LayoutCleanupReport {
   excessiveSpacingNormalized: number;
   duplicateBoundaryLinesRemoved: number;
   lowConfidenceBoundariesPreserved: number;
+  uncertainBoundariesCount?: number;
+  safeToMergeCount?: number;
+  safeToSeparateCount?: number;
+  splitWordsJoinedCount?: number;
+  unhyphenatedWordsReconstructedCount?: number;
+  ambiguousFragmentsPreservedCount?: number;
+  prosePoetryProtectedCount?: number;
   chaptersIntact: boolean;
   contentLosslessVerified: boolean;
   decisions: PageBoundaryMergeDecision[];
@@ -174,6 +223,18 @@ export interface ProcessingState {
   logMessages: string[];
 }
 
+export type DocumentSemanticSectionType =
+  | 'title-page'
+  | 'frontmatter'
+  | 'part'
+  | 'chapter'
+  | 'section'
+  | 'subsection'
+  | 'backmatter'
+  | 'uncertain';
+
+export type OutlineReviewStatus = 'confirmed' | 'inferred' | 'uncertain';
+
 export interface EpubTocItem {
   id: string;
   title: string;
@@ -182,7 +243,32 @@ export interface EpubTocItem {
   targetHref: string;
   anchorId?: string;
   rawLine?: string;
+  semanticType?: DocumentSemanticSectionType;
+  originalHeadingText?: string;
+  explicitNumberLabel?: string;
+  parentId?: string;
+  sourcePageReferences?: number[];
+  confidence?: number;
+  reviewStatus?: OutlineReviewStatus;
   children: EpubTocItem[];
+}
+
+export interface UncertainHeadingDiagnostic {
+  pageNumber: number;
+  text: string;
+  reason: string;
+  confidence: number;
+}
+
+export interface CanonicalDocumentOutline {
+  bookTitle: string;
+  bookAuthor?: string;
+  language: 'bn' | 'en' | 'ar' | 'hi';
+  source: 'pdf_outline' | 'printed_toc' | 'body_headings_fallback';
+  entries: EpubTocItem[];
+  flatEntries: EpubTocItem[];
+  confirmedChapterPageNumbers: number[];
+  uncertainHeadings: UncertainHeadingDiagnostic[];
 }
 
 export interface PdfOutlineItem {
@@ -207,5 +293,6 @@ export interface TocDiagnostics {
   unresolvedCount: number;
   pipelineDurationMs: number;
 }
+
 
 

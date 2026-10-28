@@ -801,8 +801,12 @@ export async function extractStrictPageImages(
         );
       }
 
+      const sanitizedCaption = isGenericFigurePlaceholderCaption(fig.caption)
+        ? ''
+        : (fig.caption || '').trim();
+
       results.push({
-        caption: fig.caption || 'চিত্র',
+        caption: sanitizedCaption,
         type: fig.type || 'figure',
         imageUrl: extractedData.dataUrl,
         dataUrl: extractedData.dataUrl,
@@ -824,7 +828,7 @@ export async function extractStrictPageImages(
       const extracted = await extractDirectObject(geom);
       if (extracted) {
         results.push({
-          caption: 'চিত্র',
+          caption: '',
           type: 'illustration',
           imageUrl: extracted.dataUrl,
           dataUrl: extracted.dataUrl,
@@ -844,4 +848,26 @@ export async function extractStrictPageImages(
   }
 
   return results;
+}
+
+/**
+ * Determines whether a figure caption is empty or a generic auto-generated placeholder
+ * (e.g. "চিত্র", "[চিত্র]", "*চিত্র*", "ক্যাপশন", "Figure") rather than a genuine caption from the source PDF.
+ * Preserves real captions such as "চিত্র ১: মুঘল স্থাপত্য" or "চিত্র: তাজমহলের নকশা".
+ */
+export function isGenericFigurePlaceholderCaption(caption?: string | null): boolean {
+  if (!caption) return true;
+  const trimmed = caption.trim();
+  if (!trimmed) return true;
+
+  // Strip surrounding markdown emphasis (*, _), brackets ([], ()), or quotes
+  const unwrapped = trimmed
+    .replace(/^(?:\*+|_+|\s+|\[+|\(+|["'“”‘’]+)+|(?:\*+|_+|\s+|\]+|\)+|["'“”‘’]+)+$/g, '')
+    .trim();
+  if (!unwrapped) return true;
+
+  // Match standalone generic placeholder labels with no descriptive text or figure number
+  return /^(?:চিত্র|ছবি|ক্যাপশন|চিত্রাঙ্কন|ডায়াগ্রাম|ডায়াগ্রাম|অলঙ্করণ|লোগো|আইকন|প্রতিকৃতি|figure|image|illustration|diagram|photo|caption)(?:\s*[:।.\-–—])?$/i.test(
+    unwrapped
+  );
 }

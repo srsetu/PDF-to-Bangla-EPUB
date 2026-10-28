@@ -8,13 +8,24 @@ import {
   PdfOutlineItem,
   TocDiagnostics,
   LayoutCleanupReport,
+  DocumentSemanticSectionType,
+  CanonicalDocumentOutline,
+  PdfTextBlock,
 } from '../types';
 import {
   MULTILINGUAL_TOC_LABELS,
   isTableOfContentsLabel,
+  isDataValueOrUnitLine,
+  isOrdinaryDataListPage,
+  evaluateTocPageClassification,
+  TocPageClassificationResult,
   detectTocPages,
   parseTocLineCandidate,
   extractAuthoritativeTocTree,
+  buildCanonicalDocumentOutline,
+  scoreTocToHeadingMatch,
+  buildHeadingMatchProfile,
+  hasConflictingChapterNumbers,
 } from './tocExtractor';
 import {
   stripInvalidXmlChars,
@@ -36,14 +47,21 @@ import {
   reconstructMultiColumnMarkdown,
   detectAndStripRunningHeadersFooters,
   evaluateParagraphContinuation,
+  classifyCrossPageContinuity,
+  isPoetryOrVerseBlock,
+  isUnmarkedProsePoetryBlock,
+  mapScoreToConfidenceLevel,
+  analyzeBengaliBoundaryFragments,
   reconstructDocumentLayoutForEpub,
   remapTocTreeForConsolidatedPages,
   normalizeEpubLayoutXhtml,
   cleanExcessiveInlineStyles,
   validateEpubXhtmlLayout,
 } from './epubLayoutPipeline';
+import { isGenericFigurePlaceholderCaption } from './imageExtractor';
 
 export {
+  isGenericFigurePlaceholderCaption,
   stripInvalidXmlChars,
   sanitizeXmlEntities,
   normalizeHtmlToXhtml,
@@ -58,13 +76,22 @@ export {
   reconstructMultiColumnMarkdown,
   detectAndStripRunningHeadersFooters,
   evaluateParagraphContinuation,
+  classifyCrossPageContinuity,
+  isPoetryOrVerseBlock,
+  isUnmarkedProsePoetryBlock,
+  mapScoreToConfidenceLevel,
+  analyzeBengaliBoundaryFragments,
   reconstructDocumentLayoutForEpub,
   remapTocTreeForConsolidatedPages,
   normalizeEpubLayoutXhtml,
   cleanExcessiveInlineStyles,
   validateEpubXhtmlLayout,
+  isTableOfContentsLabel,
+  isDataValueOrUnitLine,
+  isOrdinaryDataListPage,
+  evaluateTocPageClassification,
 };
-export type { PackageValidationReport };
+export type { PackageValidationReport, TocPageClassificationResult };
 
 /**
  * Escapes characters for XML / XHTML compatibility and strips invalid XML 1.0 control characters
@@ -105,8 +132,11 @@ export function stripPrintedPageNumbers(text: string, isTocPage: boolean = false
       continue;
     }
 
-    // Running header or footer with page number on top or bottom
-    if ((i === 0 || i >= lines.length - 2) && /^.*?[\-–—|]\s*(?:পৃষ্ঠা\s*)?[০-৯0-9]{1,4}\s*$/i.test(trimmed)) {
+    // Running header or footer with explicit page label or pipe separator on top or bottom
+    if (
+      (i === 0 || i >= lines.length - 2) &&
+      /^.*?(?:[\-–—|]\s*(?:পৃষ্ঠা|পেজ|page)\s*[০-৯0-9]{1,4}|\|\s*[০-৯0-9]{1,4})\s*$/i.test(trimmed)
+    ) {
       continue;
     }
 
@@ -191,14 +221,21 @@ export function getTocTitleForLanguage(lang: 'bn' | 'en' | 'ar' | 'hi'): string 
 
 /**
  * Checks whether text appears to be or contain a Table of Contents
+ * using conservative multi-signal classification.
  */
 export function isTableOfContentsText(text: string): boolean {
   if (!text) return false;
-  const sample = text.slice(0, 1000).toLowerCase();
-  for (const label of MULTILINGUAL_TOC_LABELS) {
-    if (sample.includes(label)) return true;
-  }
-  return /\b(contents|toc)\b/i.test(sample);
+  if (isOrdinaryDataListPage(text)) return false;
+
+  const syntheticPage: PageItem = {
+    pageNumber: 1,
+    status: 'completed',
+    thumbnailUrl: null,
+    fullImageUrl: null,
+    markdown: text,
+    figures: [],
+  };
+  return evaluateTocPageClassification(syntheticPage, [], 0).isTocPage;
 }
 
 /**
@@ -210,31 +247,20 @@ export function isLikelyTocPage(
   structureConfig?: StructureConfig
 ): boolean {
   if (!page) return false;
-  if (page.isTocPage) return true;
   if (page.status === 'excluded') return false;
+  if (!page.markdown || !page.markdown.trim()) return false;
+  if (isOrdinaryDataListPage(page.markdown)) return false;
 
   const pool = allPages && allPages.length > 0 ? allPages : [page];
   const detectedPages = detectTocPages(pool, structureConfig);
   if (detectedPages.includes(page.pageNumber)) {
     return true;
   }
-
-  // Single-page fallback verification if allPages was not provided
-  if (page.markdown) {
-    const lines = page.markdown.split('\n').map((l) => l.trim()).filter(Boolean);
-    const hasTocLabel = lines.slice(0, 5).some((l) => isTableOfContentsLabel(l));
-    if (hasTocLabel) {
-      let candidateCount = 0;
-      for (const line of lines) {
-        if (parseTocLineCandidate(line, page.pageNumber)) {
-          candidateCount++;
-        }
-      }
-      return candidateCount >= 2;
-    }
+  if (pool.length > 1) {
+    return false;
   }
 
-  return false;
+  return evaluateTocPageClassification(page, pool).isTocPage;
 }
 
 
@@ -279,6 +305,192 @@ export interface DetectedHeadingInfo {
   anchorId: string;
   isCenter: boolean;
   rawMatched: string;
+  semanticType?: DocumentSemanticSectionType;
+  explicitNumberLabel?: string;
+  confidence?: number;
+  isConfirmedChapter?: boolean;
+  isStandaloneChapterNumberLine?: boolean;
+}
+
+export interface HeadingDetectionContext {
+  prevNonEmptyLine?: string;
+  nextNonEmptyLine?: string;
+  isAtPageTop?: boolean;
+  layoutBlocks?: PdfTextBlock[];
+}
+
+/**
+ * Checks whether a candidate heading text contains OCR corruption, unresolved mixed scripts,
+ * or incomplete trailing clause markers that make it an ambiguous OCR fragment rather than a real heading.
+ */
+export function isAmbiguousOrCorruptedHeadingCandidate(text: string): boolean {
+  if (!text) return true;
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+
+  // Reject lines with heavy symbol/punctuation noise
+  if (/[?@#$%^&*~_=]{2,}/.test(trimmed)) return true;
+
+  // Reject lines that contain no script letters at all (unless a short 1-3 digit standalone chapter number)
+  if (
+    !/[\u0980-\u09E5\u09F0-\u09FFa-zA-Z\u0600-\u06FF\u0900-\u0965]/.test(trimmed) &&
+    !/^[০-৯0-9]{1,3}$/.test(trimmed)
+  ) {
+    return true;
+  }
+
+  // Reject lines where a Latin letter or non-Bengali Indic script character is embedded mid-word inside Bengali
+  if (/[\u0980-\u09FF][a-zA-Z\u0900-\u097F\u0C00-\u0C7F]|(?:[a-zA-Z\u0900-\u097F\u0C00-\u0C7F])[\u0980-\u09FF]/.test(trimmed)) {
+    return true;
+  }
+
+  // Reject fragments ending with a comma, semicolon, or coordinating conjunction (indicating a split sentence)
+  if (/[,;]\s*$/.test(trimmed)) return true;
+  if (/\s+(?:এবং|ও|কিন্তু|অথবা|বা|যে|যা|কারণ|যদি|বলে|করে|হয়ে|হয়ে)\s*$/i.test(trimmed)) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Classifies the semantic role and extracts any explicit numbering label present in the heading text.
+ * Never fabricates a number when none is present in the source.
+ */
+export function classifyHeadingSemanticTypeAndLabel(
+  cleanText: string,
+  level: 1 | 2 | 3 | 4
+): {
+  semanticType: DocumentSemanticSectionType;
+  explicitNumberLabel?: string;
+  isStandaloneChapterNumberLine: boolean;
+} {
+  const trimmed = cleanText.trim();
+
+  // Front matter
+  if (
+    /^(?:Preface|Foreword|Introduction|Prologue|Dedication|Acknowledgments|Acknowledgements)\b/i.test(trimmed) ||
+    /^(?:ভূমিকা|মুখবন্ধ|প্রাককথন|প্রস্তাবনা|উৎসর্গ|লেখকের কথা|প্রকাশকের কথা|কৃতজ্ঞতা স্বীকার|গ্রন্থকারের নিবেদন|নিবেদন)(?=\s|$|[:।.\-–—])/i.test(
+      trimmed
+    )
+  ) {
+    return { semanticType: 'frontmatter', isStandaloneChapterNumberLine: false };
+  }
+
+  // Back matter
+  if (
+    /^(?:Epilogue|Conclusion|Afterword|Appendix(?:\s+[A-Z0-9]+)?|Appendices|Bibliography|References|Glossary|Index)\b/i.test(
+      trimmed
+    ) ||
+    /^(?:উপসংহার|পরিশিষ্ট(?:\s+[ক-হ০-৯\d]+)?|নির্ঘণ্ট|গ্রন্থপঞ্জি|তথ্যসূত্র|টীকা|শব্দকোষ)(?=\s|$|[:।.\-–—])/i.test(trimmed)
+  ) {
+    return { semanticType: 'backmatter', isStandaloneChapterNumberLine: false };
+  }
+
+  // Part / Volume
+  const partMatch =
+    trimmed.match(
+      /^((?:Part|Volume|Book|Act|Tome|Band)\s+(?:[IVXLCDM\d]+|One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten))\b/i
+    ) ||
+    trimmed.match(
+      /^((?:(?:প্রথম|দ্বিতীয়|তৃতীয়|চতুর্থ|পঞ্চম|ষষ্ঠ|সপ্তম|অষ্টম|নবম|দশম|একাদশ|দ্বাদশ|[০-৯\d]+)\s*(?:পর্ব|খণ্ড|ভাগ|অঙ্ক)|(?:পর্ব|খণ্ড|ভাগ|অঙ্ক)\s*(?:[০-৯\d]+|[IVXLCDM]+|প্রথম|দ্বিতীয়|তৃতীয়|চতুর্থ|পঞ্চম|ষষ্ঠ|সপ্তম|অষ্টম|নবম|দশম|এক|দুই|তিন|চার|পাঁচ|ছয়|সাত|আট|নয়|দশ)))(?=\s|$|[:।.\-–—])/i
+    );
+  if (partMatch) {
+    const label = partMatch[1].trim();
+    const remainder = trimmed.slice(partMatch[0].length).replace(/^[\s:।.\-–—]+/, '').trim();
+    return {
+      semanticType: 'part',
+      explicitNumberLabel: label,
+      isStandaloneChapterNumberLine: remainder.length === 0,
+    };
+  }
+
+  // Chapter with explicit keyword (অধ্যায়, পরিচ্ছেদ, Chapter, etc.)
+  const chapterMatch =
+    trimmed.match(
+      /^((?:Chapter|Chapitre|Kapitel)\s+(?:[IVXLCDM\d]+|One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten))\b/i
+    ) ||
+    trimmed.match(
+      /^((?:(?:প্রথম|দ্বিতীয়|তৃতীয়|চতুর্থ|পঞ্চম|ষষ্ঠ|সপ্তম|অষ্টম|নবম|দশম|একাদশ|দ্বাদশ|ত্রয়োদশ|চতুর্দশ|পঞ্চদশ|ষোড়শ|সপ্তদশ|অষ্টাদশ|ঊনবিংশ|বিংশ|[০-৯\d]+)\s*(?:অধ্যায়|অধ্যায়|পরিচ্ছেদ)|(?:অধ্যায়|অধ্যায়|পরিচ্ছেদ)\s*(?:[০-৯\d]+|[IVXLCDM]+|প্রথম|দ্বিতীয়|তৃতীয়|চতুর্থ|পঞ্চম|ষষ্ঠ|সপ্তম|অষ্টম|নবম|দশম|এক|দুই|তিন|চার|পাঁচ|ছয়|সাত|আট|নয়|দশ)))(?=\s|$|[:।.\-–—])/i
+    );
+  if (chapterMatch) {
+    const label = chapterMatch[1].trim();
+    const remainder = trimmed.slice(chapterMatch[0].length).replace(/^[\s:।.\-–—]+/, '').trim();
+    return {
+      semanticType: 'chapter',
+      explicitNumberLabel: label,
+      isStandaloneChapterNumberLine: remainder.length === 0,
+    };
+  }
+
+  // Multi-level numeric subsections (e.g. ১.১.১ or 1.1.1 -> subsection; ১.১ or 1.1 -> section)
+  const subNum3Match = trimmed.match(/^([০-৯\d]+\.[০-৯\d]+\.[০-৯\d]+(?:\.[০-৯\d]+)?)\b/);
+  if (subNum3Match) {
+    return {
+      semanticType: 'subsection',
+      explicitNumberLabel: subNum3Match[1],
+      isStandaloneChapterNumberLine: false,
+    };
+  }
+  const subNum2Match = trimmed.match(/^([০-৯\d]+\.[০-৯\d]+)\b/);
+  if (subNum2Match) {
+    return {
+      semanticType: 'section',
+      explicitNumberLabel: subNum2Match[1],
+      isStandaloneChapterNumberLine: false,
+    };
+  }
+
+  // Bengali alphabetical section / subsection labels: ক., (ক), ক), [ক], ক —
+  const bengaliAlphaMatch = trimmed.match(/^([\(\[]?[ক-হ][\)\]\.]|[ক-হ]\s*[—–:-])(?=\s)/);
+  if (bengaliAlphaMatch) {
+    return {
+      semanticType: level >= 3 ? 'subsection' : 'section',
+      explicitNumberLabel: bengaliAlphaMatch[1].trim(),
+      isStandaloneChapterNumberLine: false,
+    };
+  }
+
+  // Numbered Level-1 chapter (e.g. "১. সোনার তরী" or "১ : সূচনা")
+  const leadingNumMatch = trimmed.match(/^([০-৯\d]+[\.\):])(?:\s+|$)/);
+  if (leadingNumMatch && level === 1) {
+    const label = leadingNumMatch[1].replace(/[:\.\)]$/, '').trim();
+    const remainder = trimmed.slice(leadingNumMatch[0].length).trim();
+    return {
+      semanticType: 'chapter',
+      explicitNumberLabel: label,
+      isStandaloneChapterNumberLine: remainder.length === 0,
+    };
+  }
+
+  return {
+    semanticType: level === 1 ? 'chapter' : level === 2 ? 'section' : 'subsection',
+    isStandaloneChapterNumberLine: false,
+  };
+}
+
+/**
+ * Checks if a candidate line at the top of a page is backed by larger typography in PDF layoutBlocks.
+ */
+function hasLargerTypographyInLayoutBlocks(text: string, layoutBlocks?: PdfTextBlock[]): boolean {
+  if (!layoutBlocks || layoutBlocks.length < 2) return false;
+  const sizes = layoutBlocks
+    .map((b) => b.fontSize)
+    .filter((s): s is number => typeof s === 'number' && s > 0)
+    .sort((a, b) => a - b);
+  if (sizes.length < 2) return false;
+
+  const baselineSize = sizes[Math.floor((sizes.length - 1) / 2)];
+  const cleanTarget = text.replace(/[#*_<>\[\]]/g, '').trim();
+  if (!cleanTarget) return false;
+
+  const matchingBlock = layoutBlocks.find(
+    (b) => b.text && (b.text.includes(cleanTarget) || cleanTarget.includes(b.text.trim()))
+  );
+  if (matchingBlock && typeof matchingBlock.fontSize === 'number') {
+    return matchingBlock.fontSize >= baselineSize * 1.22;
+  }
+  return false;
 }
 
 /**
@@ -289,7 +501,8 @@ export function detectHeadingFromLine(
   rawLine: string,
   pageNumber: number,
   headingCounter: number,
-  hasPartsInDoc: boolean = false
+  hasPartsInDoc: boolean = false,
+  context?: HeadingDetectionContext
 ): DetectedHeadingInfo | null {
   const trimmed = rawLine.trim();
   if (!trimmed) return null;
@@ -316,6 +529,10 @@ export function detectHeadingFromLine(
     const cleanText = cleanHeadingText(text);
     if (!cleanText) return null;
 
+    const isAmbiguous = isAmbiguousOrCorruptedHeadingCandidate(cleanText);
+    if (isAmbiguous) return null;
+
+    const meta = classifyHeadingSemanticTypeAndLabel(cleanText, level);
     const anchorId = createHeadingAnchorId(pageNumber, headingCounter, cleanText);
     return {
       level,
@@ -323,6 +540,11 @@ export function detectHeadingFromLine(
       anchorId,
       isCenter,
       rawMatched: rawLine,
+      semanticType: meta.semanticType,
+      explicitNumberLabel: meta.explicitNumberLabel,
+      confidence: 0.95,
+      isConfirmedChapter: level === 1,
+      isStandaloneChapterNumberLine: meta.isStandaloneChapterNumberLine,
     };
   }
 
@@ -335,6 +557,10 @@ export function detectHeadingFromLine(
     const cleanText = cleanHeadingText(text);
     if (!cleanText) return null;
 
+    const isAmbiguous = isAmbiguousOrCorruptedHeadingCandidate(cleanText);
+    if (isAmbiguous) return null;
+
+    const meta = classifyHeadingSemanticTypeAndLabel(cleanText, level);
     const anchorId = createHeadingAnchorId(pageNumber, headingCounter, cleanText);
     return {
       level,
@@ -342,6 +568,11 @@ export function detectHeadingFromLine(
       anchorId,
       isCenter,
       rawMatched: rawLine,
+      semanticType: meta.semanticType,
+      explicitNumberLabel: meta.explicitNumberLabel,
+      confidence: 0.95,
+      isConfirmedChapter: level === 1,
+      isStandaloneChapterNumberLine: meta.isStandaloneChapterNumberLine,
     };
   }
 
@@ -354,7 +585,8 @@ export function detectHeadingFromLine(
     trimmed.includes('[IMAGE_FIGURE') ||
     trimmed.startsWith('![') ||
     trimmed.startsWith('[^') ||
-    /^[-=—–_*.]{3,}$/.test(trimmed)
+    /^[-=—–_*.]{3,}$/.test(trimmed) ||
+    isDataValueOrUnitLine(trimmed)
   ) {
     return null;
   }
@@ -377,14 +609,16 @@ export function detectHeadingFromLine(
 
   // Length constraints: headings are concise, not entire paragraphs
   if (unwrapped.length > 120 || unwrapped.length < 2) return null;
+  if (isAmbiguousOrCorruptedHeadingCandidate(unwrapped)) return null;
 
   // Signal 3: Major Part / Volume keywords (Bengali & English & Latin)
   const isPart =
     /^(?:Part|Volume|Book|Act|Tome|Band)\s+(?:[IVXLCDM\d]+|One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten)\b/i.test(unwrapped) ||
-    /^(?:(?:প্রথম|দ্বিতীয়|তৃতীয়|চতুর্থ|পঞ্চম|ষষ্ঠ|সপ্তম|অষ্টম|নবম|দশম|[০-৯\d]+)\s*(?:পর্ব|খণ্ড|ভাগ|অঙ্ক)|(?:পর্ব|খণ্ড|ভাগ|অঙ্ক)\s*(?:[০-৯\d]+|[IVXLCDM]+|প্রথম|দ্বিতীয়|তৃতীয়|চতুর্থ...))\b/i.test(unwrapped);
+    /^(?:(?:প্রথম|দ্বিতীয়|তৃতীয়|চতুর্থ|পঞ্চম|ষষ্ঠ|সপ্তম|অষ্টম|নবম|দশম|একাদশ|দ্বাদশ|[০-৯\d]+)\s*(?:পর্ব|খণ্ড|ভাগ|অঙ্ক)|(?:পর্ব|খণ্ড|ভাগ|অঙ্ক)\s*(?:[০-৯\d]+|[IVXLCDM]+|প্রথম|দ্বিতীয়|তৃতীয়|চতুর্থ|পঞ্চম|ষষ্ঠ|সপ্তম|অষ্টম|নবম|দশম|এক|দুই|তিন|চার|পাঁচ|ছয়|সাত|আট|নয়|দশ))\b/i.test(unwrapped);
 
   if (isPart) {
     const cleanText = cleanHeadingText(unwrapped);
+    const meta = classifyHeadingSemanticTypeAndLabel(cleanText, 1);
     const anchorId = createHeadingAnchorId(pageNumber, headingCounter, cleanText);
     return {
       level: 1,
@@ -392,34 +626,47 @@ export function detectHeadingFromLine(
       anchorId,
       isCenter: isExplicitlyStyled,
       rawMatched: rawLine,
+      semanticType: 'part',
+      explicitNumberLabel: meta.explicitNumberLabel,
+      confidence: 0.95,
+      isConfirmedChapter: true,
+      isStandaloneChapterNumberLine: meta.isStandaloneChapterNumberLine,
     };
   }
 
   // Signal 4: Chapter keywords (Bengali & English & Latin)
   const isChapter =
     /^(?:Chapter|Chapitre|Kapitel)\s+(?:[IVXLCDM\d]+|One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten)\b/i.test(unwrapped) ||
-    /^(?:(?:প্রথম|দ্বিতীয়|তৃতীয়|চতুর্থ|পঞ্চম|ষষ্ঠ|সপ্তম|অষ্টম|নবম|দশম|[০-৯\d]+)\s*(?:অধ্যায়|অধ্যায়|পরিচ্ছেদ)|(?:অধ্যায়|অধ্যায়|পরিচ্ছেদ)\s*(?:[০-৯\d]+|[IVXLCDM]+|প্রথম|দ্বিতীয়|তৃতীয়...))\b/i.test(unwrapped);
+    /^(?:(?:প্রথম|দ্বিতীয়|তৃতীয়|চতুর্থ|পঞ্চম|ষষ্ঠ|সপ্তম|অষ্টম|নবম|দশম|একাদশ|দ্বাদশ|ত্রয়োদশ|চতুর্দশ|পঞ্চদশ|ষোড়শ|সপ্তদশ|অষ্টাদশ|ঊনবিংশ|বিংশ|[০-৯\d]+)\s*(?:অধ্যায়|অধ্যায়|পরিচ্ছেদ)|(?:অধ্যায়|অধ্যায়|পরিচ্ছেদ)\s*(?:[০-৯\d]+|[IVXLCDM]+|প্রথম|দ্বিতীয়|তৃতীয়|চতুর্থ|পঞ্চম|ষষ্ঠ|সপ্তম|অষ্টম|নবম|দশম|এক|দুই|তিন|চার|পাঁচ|ছয়|সাত|আট|নয়|দশ))(?=\s|$|[:।.\-–—])/i.test(unwrapped);
 
   if (isChapter) {
     const cleanText = cleanHeadingText(unwrapped);
+    const lvl: 1 | 2 = hasPartsInDoc ? 2 : 1;
+    const meta = classifyHeadingSemanticTypeAndLabel(cleanText, lvl);
     const anchorId = createHeadingAnchorId(pageNumber, headingCounter, cleanText);
     return {
-      level: hasPartsInDoc ? 2 : 1,
+      level: lvl,
       title: cleanText,
       anchorId,
       isCenter: isExplicitlyStyled,
       rawMatched: rawLine,
+      semanticType: 'chapter',
+      explicitNumberLabel: meta.explicitNumberLabel,
+      confidence: 0.95,
+      isConfirmedChapter: true,
+      isStandaloneChapterNumberLine: meta.isStandaloneChapterNumberLine,
     };
   }
 
   // Signal 5: Front matter & Back matter structural headings
   const isFrontBackMatter =
     /^(?:Preface|Foreword|Introduction|Prologue|Dedication|Acknowledgments|Acknowledgements|Epilogue|Conclusion|Afterword|Appendix(?:\s+[A-Z0-9]+)?|Appendices|Bibliography|References|Glossary|Index)\b/i.test(unwrapped) ||
-    /^(?:ভূমিকা|মুখবন্ধ|প্রাককথন|প্রস্তাবনা|উৎসর্গ|লেখকের কথা|প্রকাশকের কথা|কৃতজ্ঞতা স্বীকার|উপসংহার|পরিশিষ্ট(?:\s+[ক-ঞ০-৯\d]+)?|নির্ঘণ্ট|গ্রন্থপঞ্জি|তথ্যসূত্র|টীকা)\b/i.test(unwrapped);
+    /^(?:ভূমিকা|মুখবন্ধ|প্রাককথন|প্রস্তাবনা|উৎসর্গ|লেখকের কথা|প্রকাশকের কথা|কৃতজ্ঞতা স্বীকার|গ্রন্থকারের নিবেদন|উপসংহার|পরিশিষ্ট(?:\s+[ক-হ০-৯\d]+)?|নির্ঘণ্ট|গ্রন্থপঞ্জি|তথ্যসূত্র|টীকা|শব্দকোষ)(?=\s|$|[:।.\-–—])/i.test(unwrapped);
 
   if (isFrontBackMatter) {
     if (unwrapped.length <= 60 || isExplicitlyStyled) {
       const cleanText = cleanHeadingText(unwrapped);
+      const meta = classifyHeadingSemanticTypeAndLabel(cleanText, 1);
       const anchorId = createHeadingAnchorId(pageNumber, headingCounter, cleanText);
       return {
         level: 1,
@@ -427,61 +674,150 @@ export function detectHeadingFromLine(
         anchorId,
         isCenter: isExplicitlyStyled,
         rawMatched: rawLine,
+        semanticType: meta.semanticType,
+        confidence: 0.92,
+        isConfirmedChapter: true,
+        isStandaloneChapterNumberLine: false,
       };
     }
   }
 
-  // Signal 6: Numbered hierarchy patterns: 1.1.1 or ১.১.১ (Level 3/4) vs 1.1 or ১.১ (Level 2/3)
+  // Signal 6A: Numbered hierarchy patterns: 1.1.1 or ১.১.১ (Level 3/4) vs 1.1 or ১.১ (Level 2/3)
   if (/^[০-৯\d]+\.[০-৯\d]+\.[০-৯\d]+(?:\s+.*)?$/.test(unwrapped)) {
     const cleanText = cleanHeadingText(unwrapped);
+    const lvl: 3 | 4 = hasPartsInDoc ? 4 : 3;
+    const meta = classifyHeadingSemanticTypeAndLabel(cleanText, lvl);
     const anchorId = createHeadingAnchorId(pageNumber, headingCounter, cleanText);
     return {
-      level: hasPartsInDoc ? 4 : 3,
+      level: lvl,
       title: cleanText,
       anchorId,
       isCenter: isExplicitlyStyled,
       rawMatched: rawLine,
+      semanticType: 'subsection',
+      explicitNumberLabel: meta.explicitNumberLabel,
+      confidence: 0.9,
+      isConfirmedChapter: false,
     };
   }
 
   if (/^[০-৯\d]+\.[০-৯\d]+(?:\s+.*)?$/.test(unwrapped)) {
     const cleanText = cleanHeadingText(unwrapped);
+    const lvl: 2 | 3 = hasPartsInDoc ? 3 : 2;
+    const meta = classifyHeadingSemanticTypeAndLabel(cleanText, lvl);
     const anchorId = createHeadingAnchorId(pageNumber, headingCounter, cleanText);
     return {
-      level: hasPartsInDoc ? 3 : 2,
+      level: lvl,
       title: cleanText,
       anchorId,
       isCenter: isExplicitlyStyled,
       rawMatched: rawLine,
+      semanticType: 'section',
+      explicitNumberLabel: meta.explicitNumberLabel,
+      confidence: 0.9,
+      isConfirmedChapter: false,
     };
   }
 
+  // Signal 6B: Bengali Alphabetical Section / Subsection Headings: ক. ..., (ক) ..., ক) ..., ক — ...
+  const bengaliAlphaMatch = unwrapped.match(
+    /^([\(\[]?[ক-হ][\)\]\.]|[ক-হ]\s*[—–:-])\s+([^\n]{2,65})$/
+  );
+  if (bengaliAlphaMatch) {
+    const bodyPart = bengaliAlphaMatch[2].trim();
+    const wordCount = bodyPart.split(/\s+/).length;
+    const endsWithSentencePunct = /[।?!]$/.test(bodyPart);
+    const prevIsAlphaListItem =
+      context?.prevNonEmptyLine &&
+      /^([\(\[]?[ক-হ][\)\]\.]|[ক-হ]\s*[—–:-])\s+/.test(context.prevNonEmptyLine.trim());
+    const nextIsAlphaListItem =
+      context?.nextNonEmptyLine &&
+      /^([\(\[]?[ক-হ][\)\]\.]|[ক-হ]\s*[—–:-])\s+/.test(context.nextNonEmptyLine.trim());
+
+    if (
+      !endsWithSentencePunct &&
+      wordCount <= 8 &&
+      (isExplicitlyStyled || (!prevIsAlphaListItem && !nextIsAlphaListItem))
+    ) {
+      const cleanText = cleanHeadingText(unwrapped);
+      const lvl: 2 | 3 = hasPartsInDoc ? 3 : 2;
+      const anchorId = createHeadingAnchorId(pageNumber, headingCounter, cleanText);
+      return {
+        level: lvl,
+        title: cleanText,
+        anchorId,
+        isCenter: isExplicitlyStyled,
+        rawMatched: rawLine,
+        semanticType: 'section',
+        explicitNumberLabel: bengaliAlphaMatch[1].trim(),
+        confidence: isExplicitlyStyled ? 0.9 : 0.82,
+        isConfirmedChapter: false,
+      };
+    }
+  }
+
   // Signal 7: Section / Scene keywords
-  if (/^(?:Section|Scene|অনুচ্ছেদ|উপ-?অধ্যায়|দৃশ্য)\s+[০-৯\dIVXLCDM]+/i.test(unwrapped)) {
+  if (/^(?:Section|Scene|অনুচ্ছেদ|উপ-?অধ্যায়|উপ-?অধ্যায়|দৃশ্য)\s+[০-৯\dIVXLCDMক-হ]+/i.test(unwrapped)) {
     const cleanText = cleanHeadingText(unwrapped);
+    const lvl: 2 | 3 = hasPartsInDoc ? 3 : 2;
     const anchorId = createHeadingAnchorId(pageNumber, headingCounter, cleanText);
     return {
-      level: hasPartsInDoc ? 3 : 2,
+      level: lvl,
       title: cleanText,
       anchorId,
       isCenter: isExplicitlyStyled,
       rawMatched: rawLine,
+      semanticType: 'section',
+      confidence: 0.88,
+      isConfirmedChapter: false,
     };
+  }
+
+  // Signal 7B: Typography / Layout-Block Font-Size Confirmed Heading at Top of Page
+  if (
+    context?.isAtPageTop &&
+    context?.layoutBlocks &&
+    unwrapped.length <= 75 &&
+    !/[।?!,;]$/.test(unwrapped) &&
+    hasLargerTypographyInLayoutBlocks(unwrapped, context.layoutBlocks)
+  ) {
+    const cleanText = cleanHeadingText(unwrapped);
+    if (cleanText.length >= 2 && !/^(চিত্র|ছবি|নোট|চিত্রাঙ্কন|Fig|Figure|Note|Source|উৎস)\b/i.test(cleanText)) {
+      const anchorId = createHeadingAnchorId(pageNumber, headingCounter, cleanText);
+      return {
+        level: 1,
+        title: cleanText,
+        anchorId,
+        isCenter: true,
+        rawMatched: rawLine,
+        semanticType: 'chapter',
+        confidence: 0.88,
+        isConfirmedChapter: true,
+      };
+    }
   }
 
   // Signal 8: Standalone bold line or centered line that is short and does NOT end with sentence terminator
   if (isExplicitlyStyled && unwrapped.length <= 65) {
-    const endsWithTerminator = /[।\.\?!,;]$/.test(unwrapped);
+    const endsWithTerminator = /[।\.\?!,;:—–-]$/.test(unwrapped);
     if (!endsWithTerminator) {
       const cleanText = cleanHeadingText(unwrapped);
-      if (cleanText.length >= 3 && !/^(চিত্র|নোট|চিত্রাঙ্কন|Fig|Figure|Note|Source|উৎস)\b/i.test(cleanText)) {
+      if (
+        cleanText.length >= 3 &&
+        !/^(চিত্র|ছবি|নোট|চিত্রাঙ্কন|Fig|Figure|Note|Source|উৎস)\b/i.test(cleanText) &&
+        !isAmbiguousOrCorruptedHeadingCandidate(cleanText)
+      ) {
         const anchorId = createHeadingAnchorId(pageNumber, headingCounter, cleanText);
+        const isTopOfPageChapter = Boolean(context?.isAtPageTop);
         return {
           level: hasPartsInDoc ? 2 : 1,
           title: cleanText,
           anchorId,
           isCenter: isExplicitlyStyled,
           rawMatched: rawLine,
+          semanticType: isTopOfPageChapter ? 'chapter' : 'section',
+          confidence: isTopOfPageChapter ? 0.8 : 0.7,
+          isConfirmedChapter: isTopOfPageChapter,
         };
       }
     }
@@ -503,10 +839,11 @@ export function parseTocLineWithLevel(rawLine: string): ParsedTocLineResult | nu
   const trimmed = rawLine.trim();
   if (!trimmed) return null;
 
-  // Ignore header lines or dividers
-  if (/^(?:#+\s*)?(?:সূচিপত্র|সূচীপত্র|সূচি|contents|index|table of contents|فهرس)\b/i.test(trimmed)) return null;
+  // Ignore header lines, dividers, or ordinary data/unit/price lines
+  if (isTableOfContentsLabel(trimmed)) return null;
   if (/^[-=—–_*.]{3,}$/.test(trimmed)) return null;
   if (/^(?:বিশেষ বিজ্ঞপ্তি|পরিশিষ্ট|বিজ্ঞপ্তি|পুনশ্চ)/i.test(trimmed) && !/[০-৯0-9]{1,4}\s*$/.test(trimmed)) return null;
+  if (isDataValueOrUnitLine(trimmed)) return null;
 
   // Detect leading whitespace before trimming (for indentation levels)
   const leadingSpaces = rawLine.match(/^\s*/)?.[0]?.replace(/\t/g, '  ').length || 0;
@@ -604,33 +941,289 @@ export interface ExtractedHeading {
   title: string;
   anchorId: string;
   pageNumber: number;
+  semanticType?: DocumentSemanticSectionType;
+  explicitNumberLabel?: string;
+  confidence?: number;
+  isConfirmedChapter?: boolean;
 }
 
 /**
- * Extracts all genuine headings from a page with stable anchor IDs
+ * Checks if the line immediately following a standalone chapter-number line
+ * (e.g. "প্রথম অধ্যায়" followed by "বাবরের ভারত অভিযান") is a genuine chapter title line
+ * that should be paired with the chapter number header.
+ */
+export function extractPairedChapterSubtitle(nextLine: string | undefined): string | null {
+  if (!nextLine) return null;
+  const trimmed = nextLine.trim();
+  if (!trimmed) return null;
+
+  // Reject structural blocks, lists, quotes, tables, figures, anchors, or dividers
+  if (
+    trimmed.startsWith('- ') ||
+    trimmed.startsWith('* ') ||
+    trimmed.startsWith('> ') ||
+    trimmed.startsWith('|') ||
+    trimmed.startsWith('[^') ||
+    trimmed.includes('[IMAGE_FIGURE:') ||
+    trimmed.startsWith('![') ||
+    trimmed.includes('epub-page-anchor') ||
+    /^[-=—–_*.]{3,}$/.test(trimmed) ||
+    /^[০-৯0-9]+[\.\)]\s+/.test(trimmed) ||
+    /^(?:[\(\[]?[ক-হa-zA-Z][\)\]\.])\s+/.test(trimmed)
+  ) {
+    return null;
+  }
+
+  const hasExplicitMarkup =
+    /^#{1,4}\s+/.test(trimmed) ||
+    /^\*\*[^*]+\*\*$/.test(trimmed) ||
+    /^(?:<center>|\[center\]|<h[1-4]\b)/i.test(trimmed);
+
+  const cleaned = cleanHeadingText(
+    trimmed
+      .replace(/^#{1,6}\s+/, '')
+      .replace(/^<(?:center|h[1-6])[^>]*>(.*?)<\/(?:center|h[1-6])>$/i, '$1')
+      .replace(/^\[center\](.*?)\[\/center\]$/i, '$1')
+  );
+
+  if (!cleaned || cleaned.length < 2 || cleaned.length > 75) return null;
+  if (isTableOfContentsLabel(cleaned) || isGenericFigurePlaceholderCaption(cleaned)) return null;
+  if (isAmbiguousOrCorruptedHeadingCandidate(cleaned)) return null;
+
+  // Do not pair if the second line is itself another standalone chapter/part number label
+  if (
+    /^(?:(?:প্রথম|দ্বিতীয়|দ্বিতীয়|তৃতীয়|তৃতীয়|চতুর্থ|পঞ্চম|ষষ্ঠ|সপ্তম|অষ্টম|নবম|দশম|একাদশ|দ্বাদশ)\s+(?:অধ্যায়|অধ্যায়|পর্ব|খণ্ড)|(?:অধ্যায়|অধ্যায়|পর্ব|খণ্ড|Chapter|Part)\s*[০-৯0-9IVXLCDM]+)$/i.test(
+      cleaned
+    )
+  ) {
+    return null;
+  }
+
+  // Reject figure captions
+  if (/^(?:চিত্র|ছবি|Figure|Fig\.)\s*[০-৯0-9:]/i.test(cleaned)) {
+    return null;
+  }
+
+  const words = cleaned.split(/\s+/).filter(Boolean);
+  if (words.length === 0 || words.length > (hasExplicitMarkup ? 10 : 6)) {
+    return null;
+  }
+
+  // Unmarked lines ending in prose sentence punctuation or containing finite narrative verbs are body paragraphs
+  if (!hasExplicitMarkup) {
+    if (/[।.?!,;—–-]$/.test(cleaned)) return null;
+    if (/(?:করেন|করেছেন|হয়েছিল|হয়েছিল|বললেন|বলেছেন|ছিলেন|থাকে|যায়|যায়|আছে|হলো|হল)\b/.test(cleaned)) {
+      return null;
+    }
+  }
+
+  return cleaned;
+}
+
+const MAX_EXTRACT_HEADINGS_CACHE_SIZE = 600;
+const extractHeadingsCache = new Map<string, ExtractedHeading[]>();
+
+/**
+ * Matches a consolidated page-boundary marker (<span id="page_N" class="epub-page-anchor"></span>)
+ * in any attribute order or self-closing XML form.
+ */
+function parseConsolidatedPageAnchorLine(trimmedLine: string): number | null {
+  if (!trimmedLine || !trimmedLine.includes('epub-page-anchor')) return null;
+  const match =
+    trimmedLine.match(
+      /^<span\s+[^>]*\bid=["']page_(\d+)["'][^>]*\bclass=["'][^"']*epub-page-anchor[^"']*["'][^>]*>(?:<\/span>)?$/i
+    ) ||
+    trimmedLine.match(
+      /^<span\s+[^>]*\bclass=["'][^"']*epub-page-anchor[^"']*["'][^>]*\bid=["']page_(\d+)["'][^>]*>(?:<\/span>)?$/i
+    );
+  if (!match) return null;
+  const parsed = parseInt(match[1], 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+/**
+ * Extracts all genuine headings from a page (or consolidated multi-page markdown)
+ * with stable page-aware anchor IDs, semantic types, and multi-signal context.
+ * Pre-processing and per-page counter resets strictly match markdownToXhtml.
  */
 export function extractHeadingsFromMarkdown(
   markdown: string,
   pageNumber: number,
-  hasPartsInDoc: boolean = false
+  hasPartsInDoc: boolean = false,
+  layoutBlocks?: PdfTextBlock[]
 ): ExtractedHeading[] {
   if (!markdown) return [];
-  const lines = markdown.split('\n');
-  const headings: ExtractedHeading[] = [];
-  let headingCounter = 0;
 
-  for (const line of lines) {
-    const detected = detectHeadingFromLine(line, pageNumber, headingCounter + 1, hasPartsInDoc);
+  const layoutSig =
+    layoutBlocks && layoutBlocks.length > 0
+      ? layoutBlocks.map((b) => `${Math.round(b.fontSize || 0)}:${(b.text || '').slice(0, 12)}`).join('|')
+      : '';
+  const cacheKey = `${pageNumber}:${hasPartsInDoc ? 1 : 0}:${layoutSig}:${markdown}`;
+  const cached = extractHeadingsCache.get(cacheKey);
+  if (cached) return cached;
+
+  // Apply the same mixed-script correction and printed page number stripping as markdownToXhtml
+  const scriptValidated = correctBengaliMixedScriptText(markdown);
+  const pageNumStripped = stripPrintedPageNumbers(scriptValidated, false);
+  const cleanMarkdown = reconstructMultiColumnMarkdown(pageNumStripped).reorderedText;
+
+  const lines = cleanMarkdown.split('\n');
+  const headings: ExtractedHeading[] = [];
+  let activePageNumber = pageNumber || 1;
+  let headingCounter = 0;
+  let seenContentLines = 0;
+  let usedIdsOnActivePage = new Set<string>();
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    // 1. Track consolidated page-boundary anchor markers (<span id="page_N" class="epub-page-anchor"></span>)
+    const boundaryPageNum = parseConsolidatedPageAnchorLine(trimmed);
+    if (boundaryPageNum !== null) {
+      activePageNumber = boundaryPageNum;
+      headingCounter = 0;
+      seenContentLines = 0;
+      usedIdsOnActivePage = new Set<string>();
+      continue;
+    }
+
+    // 2. Skip artificial page-break tags, alignment wrapper tags, dividers, and empty HTML tags without incrementing seenContentLines
+    if (
+      /^<(?:div|p|span|br)\s+[^>]*(?:page-break|break-after|break-before|pdf-page-break)[^>]*>(?:<\/(?:div|p|span)>)?$/i.test(
+        trimmed
+      ) ||
+      /^<(?:center|div\s+align=["'](?:center|right)["']|div\s+class=["'][^"']*(?:text-center|text-right)[^"']*["'])>$/i.test(
+        trimmed
+      ) ||
+      /^<\/(?:center|div)>$/i.test(trimmed) ||
+      trimmed === '---' ||
+      trimmed === '___' ||
+      /^(\*\s*\*\s*\*|•••|•\s*•\s*•|—\s*—\s*—)$/.test(trimmed) ||
+      /^<(p|div|span|strong|em|b|i)(?:\s+[^>]*?)?>(\s|&nbsp;|&#160;|<br\s*\/?>)*<\/\1>$/i.test(
+        trimmed
+      ) ||
+      /^(?:<br\s*\/?>\s*)+$/i.test(trimmed)
+    ) {
+      continue;
+    }
+
+    // 3. Skip image/figure placeholders (and consume their immediately following caption line, matching markdownToXhtml)
+    if (trimmed.includes('[IMAGE_FIGURE:') || /^!\[[^\]]*\]\([^)]+\)$/.test(trimmed)) {
+      let lookaheadIdx = i + 1;
+      if (lookaheadIdx < lines.length && !lines[lookaheadIdx].trim() && lookaheadIdx + 1 < lines.length) {
+        lookaheadIdx++;
+      }
+      if (lookaheadIdx < lines.length) {
+        const nextTrimmed = lines[lookaheadIdx].trim();
+        if (
+          nextTrimmed &&
+          (isGenericFigurePlaceholderCaption(nextTrimmed) ||
+            /^(?:\*|_)?(?:চিত্র|ছবি|চিত্রাঙ্কন|ডায়াগ্রাম|ডায়াগ্রাম|Figure|Fig\.|Photo|Plate)\s*(?:[০-৯0-9]+\s*[:.—–-]?\s*\S+|[:.—–-]\s*\S+)/i.test(
+              nextTrimmed
+            ))
+        ) {
+          i = lookaheadIdx;
+        }
+      }
+      continue;
+    }
+
+    if (
+      isGenericFigurePlaceholderCaption(trimmed) ||
+      /^(?:\*|_)?(?:চিত্র|ছবি|চিত্রাঙ্কন|ডায়াগ্রাম|ডায়াগ্রাম|Figure|Fig\.|Photo|Plate)\s*(?:[০-৯0-9]+\s*[:.—–-]?\s*\S+|[:.—–-]\s*\S+)/i.test(
+        trimmed
+      )
+    ) {
+      continue;
+    }
+
+    let prevNonEmptyLine = '';
+    for (let p = i - 1; p >= 0; p--) {
+      const pTrim = lines[p].trim();
+      if (pTrim && !pTrim.includes('epub-page-anchor')) {
+        prevNonEmptyLine = pTrim;
+        break;
+      }
+    }
+
+    let nextNonEmptyLine = '';
+    let nextNonEmptyIdx = -1;
+    for (let n = i + 1; n < lines.length; n++) {
+      if (lines[n].trim()) {
+        nextNonEmptyLine = lines[n].trim();
+        nextNonEmptyIdx = n;
+        break;
+      }
+    }
+
+    const activeLayoutBlocks = activePageNumber === pageNumber ? layoutBlocks : undefined;
+    const detected = detectHeadingFromLine(
+      line,
+      activePageNumber,
+      headingCounter + 1,
+      hasPartsInDoc,
+      {
+        prevNonEmptyLine,
+        nextNonEmptyLine,
+        isAtPageTop: seenContentLines === 0,
+        layoutBlocks: activeLayoutBlocks,
+      }
+    );
+
     if (detected) {
       headingCounter++;
+      let finalTitle = detected.title;
+      let explicitNumberLabel = detected.explicitNumberLabel;
+
+      // Pair two-line chapter headers (e.g. "প্রথম অধ্যায়" + "বাবরের ভারত অভিযান")
+      if (
+        detected.isStandaloneChapterNumberLine &&
+        nextNonEmptyIdx !== -1 &&
+        nextNonEmptyIdx - i <= 2
+      ) {
+        const pairedSubtitle = extractPairedChapterSubtitle(nextNonEmptyLine);
+        if (pairedSubtitle) {
+          explicitNumberLabel = detected.title;
+          finalTitle = `${detected.title}: ${pairedSubtitle}`;
+          i = nextNonEmptyIdx; // Consume subtitle line so it is not extracted twice
+        }
+      }
+
+      let uniqueAnchorId = detected.anchorId;
+      if (usedIdsOnActivePage.has(uniqueAnchorId)) {
+        let suffix = 2;
+        while (usedIdsOnActivePage.has(`${uniqueAnchorId}-${suffix}`)) {
+          suffix++;
+        }
+        uniqueAnchorId = `${uniqueAnchorId}-${suffix}`;
+      }
+      usedIdsOnActivePage.add(uniqueAnchorId);
+
       headings.push({
         level: detected.level,
-        title: detected.title,
-        anchorId: detected.anchorId,
-        pageNumber,
+        title: finalTitle,
+        anchorId: uniqueAnchorId,
+        pageNumber: activePageNumber,
+        semanticType: detected.semanticType,
+        explicitNumberLabel,
+        confidence: detected.confidence,
+        isConfirmedChapter: detected.isConfirmedChapter,
       });
+      seenContentLines++;
+    } else {
+      seenContentLines++;
     }
   }
+
+  if (extractHeadingsCache.size >= MAX_EXTRACT_HEADINGS_CACHE_SIZE) {
+    const oldestKey = extractHeadingsCache.keys().next().value;
+    if (oldestKey !== undefined) {
+      extractHeadingsCache.delete(oldestKey);
+    }
+  }
+  extractHeadingsCache.set(cacheKey, headings);
 
   return headings;
 }
@@ -661,17 +1254,27 @@ export function resolveTargetPageAndAnchor(
   // 1. Direct match by exact pageNumber
   let matchedPage = allPages.find((p) => p.pageNumber === targetPageNum);
 
-  // 2. Title matching against headings or text if page number didn't match
-  const cleanSearchTitle = title
-    .replace(/^[০-৯0-9\.\s\-–—:]*/, '') // remove leading "১. " or "১.১ "
-    .trim()
-    .toLowerCase();
-
-  if (!matchedPage && cleanSearchTitle.length >= 3) {
-    matchedPage = allPages.find((p) => {
-      if (!p.markdown) return false;
-      return p.markdown.toLowerCase().includes(cleanSearchTitle);
-    });
+  // 2. Strong heading match across pages if direct pageNumber was not found
+  if (!matchedPage && title && title.trim().length >= 2) {
+    let bestPage: PageItem | undefined;
+    let bestScore = 0;
+    for (const p of allPages) {
+      if (!p.markdown) continue;
+      const headings = extractHeadingsFromMarkdown(
+        p.markdown,
+        p.pageNumber,
+        false,
+        p.layoutBlocks
+      );
+      for (const h of headings) {
+        const s = scoreTocToHeadingMatch(title, h.title, 1, h.level);
+        if (s >= 0.85 && s > bestScore) {
+          bestScore = s;
+          bestPage = p;
+        }
+      }
+    }
+    matchedPage = bestPage;
   }
 
   // 3. Fallback: Find closest valid page
@@ -685,16 +1288,36 @@ export function resolveTargetPageAndAnchor(
   const pageNum = matchedPage ? matchedPage.pageNumber : targetPageNum;
   const filename = `page_${pageNum}.xhtml`;
 
-  // 4. Look for an exact or fuzzy matching heading anchor on the target page
+  // 4. Look for an exact or strong matching heading anchor on the target page
   let anchorId: string | undefined = undefined;
-  if (matchedPage && cleanSearchTitle.length >= 2) {
-    const headings = extractHeadingsFromMarkdown(matchedPage.markdown, matchedPage.pageNumber);
-    const bestHeading = headings.find((h) => {
-      const hClean = h.title.toLowerCase().replace(/^[০-৯0-9\.\s\-–—:]*/, '').trim();
-      return hClean.includes(cleanSearchTitle) || cleanSearchTitle.includes(hClean);
-    });
+  if (matchedPage && title && title.trim().length >= 2) {
+    const headings = extractHeadingsFromMarkdown(
+      matchedPage.markdown,
+      matchedPage.pageNumber,
+      false,
+      matchedPage.layoutBlocks
+    );
+    const bestHeading = headings
+      .map((h) => ({
+        h,
+        score: scoreTocToHeadingMatch(title, h.title, 1, h.level),
+      }))
+      .filter((item) => item.score >= 0.72 && item.h.pageNumber === pageNum)
+      .sort((a, b) => b.score - a.score)[0];
+
     if (bestHeading) {
-      anchorId = bestHeading.anchorId;
+      anchorId = bestHeading.h.anchorId;
+    } else if (
+      headings.length === 1 &&
+      headings[0].level === 1 &&
+      headings[0].pageNumber === pageNum &&
+      !hasConflictingChapterNumbers(
+        buildHeadingMatchProfile(title),
+        buildHeadingMatchProfile(headings[0].title)
+      )
+    ) {
+      // Single confirmed chapter heading on the target page with no number conflict
+      anchorId = headings[0].anchorId;
     }
   }
 
@@ -788,7 +1411,12 @@ function augmentTreeWithPageSubheadings(tree: EpubTocItem[], validPages: PageIte
     const chapterPages = validPages.filter((p) => p.pageNumber >= startPage && p.pageNumber <= endPage);
 
     for (const page of chapterPages) {
-      const pageHeadings = extractHeadingsFromMarkdown(page.markdown, page.pageNumber);
+      const pageHeadings = extractHeadingsFromMarkdown(
+        page.markdown,
+        page.pageNumber,
+        false,
+        page.layoutBlocks
+      );
       for (const h of pageHeadings) {
         // Skip Level 1 headings that match the chapter title itself
         if (h.level === 1) continue;
@@ -804,16 +1432,25 @@ function augmentTreeWithPageSubheadings(tree: EpubTocItem[], validPages: PageIte
             targetPageNumber: page.pageNumber,
             targetHref: `page_${page.pageNumber}.xhtml#${h.anchorId}`,
             anchorId: h.anchorId,
+            semanticType: h.semanticType,
+            originalHeadingText: h.title,
+            explicitNumberLabel: h.explicitNumberLabel,
+            sourcePageReferences: [page.pageNumber],
+            confidence: h.confidence ?? 0.85,
+            reviewStatus: 'confirmed',
             children: [],
           };
 
           if (h.level === 2) {
+            subNode.parentId = currentChapter.id;
             currentChapter.children.push(subNode);
           } else if (h.level === 3 || h.level === 4) {
             const lastL2 = currentChapter.children[currentChapter.children.length - 1];
             if (lastL2 && lastL2.level === 2) {
+              subNode.parentId = lastL2.id;
               lastL2.children.push(subNode);
             } else {
+              subNode.parentId = currentChapter.id;
               currentChapter.children.push(subNode);
             }
           }
@@ -833,11 +1470,13 @@ function assembleHierarchyTree(
   const tree: EpubTocItem[] = [];
   let currentL1: EpubTocItem | null = null;
   let currentL2: EpubTocItem | null = null;
+  let currentL3: EpubTocItem | null = null;
   let itemCounter = 0;
 
   for (const item of flatItems) {
     itemCounter++;
     const res = resolveTargetPageAndAnchor(item.pageNumber, item.title, validPages);
+    const meta = classifyHeadingSemanticTypeAndLabel(item.title, item.level);
     const node: EpubTocItem = {
       id: `toc-${itemCounter}`,
       title: item.title,
@@ -846,6 +1485,12 @@ function assembleHierarchyTree(
       targetHref: res.targetHref,
       anchorId: res.anchorId,
       rawLine: item.rawLine,
+      semanticType: meta.semanticType,
+      originalHeadingText: item.title,
+      explicitNumberLabel: meta.explicitNumberLabel,
+      sourcePageReferences: [res.pageNumber],
+      confidence: 0.92,
+      reviewStatus: 'confirmed',
       children: [],
     };
 
@@ -853,8 +1498,10 @@ function assembleHierarchyTree(
       tree.push(node);
       currentL1 = node;
       currentL2 = null;
+      currentL3 = null;
     } else if (item.level === 2) {
       if (currentL1) {
+        node.parentId = currentL1.id;
         currentL1.children.push(node);
       } else {
         // If no parent L1 exists, keep it at top level rather than inventing an artificial parent
@@ -862,11 +1509,28 @@ function assembleHierarchyTree(
         currentL1 = node;
       }
       currentL2 = node;
-    } else {
-      // Level 3 or 4
+      currentL3 = null;
+    } else if (item.level === 3) {
       if (currentL2) {
+        node.parentId = currentL2.id;
         currentL2.children.push(node);
       } else if (currentL1) {
+        node.parentId = currentL1.id;
+        currentL1.children.push(node);
+      } else {
+        tree.push(node);
+      }
+      currentL3 = node;
+    } else {
+      // Level 4
+      if (currentL3) {
+        node.parentId = currentL3.id;
+        currentL3.children.push(node);
+      } else if (currentL2) {
+        node.parentId = currentL2.id;
+        currentL2.children.push(node);
+      } else if (currentL1) {
+        node.parentId = currentL1.id;
         currentL1.children.push(node);
       } else {
         tree.push(node);
@@ -887,7 +1551,12 @@ function buildTreeFromAllPageHeadings(
   // 1. Gather all headings from all pages
   const allHeadings: Array<ExtractedHeading & { pageNumber: number }> = [];
   for (const page of validPages) {
-    const pageHeadings = extractHeadingsFromMarkdown(page.markdown, page.pageNumber);
+    const pageHeadings = extractHeadingsFromMarkdown(
+      page.markdown,
+      page.pageNumber,
+      false,
+      page.layoutBlocks
+    );
     for (const h of pageHeadings) {
       allHeadings.push({ ...h, pageNumber: page.pageNumber });
     }
@@ -907,6 +1576,11 @@ function buildTreeFromAllPageHeadings(
         level: 1,
         targetPageNumber: page.pageNumber,
         targetHref: `page_${page.pageNumber}.xhtml`,
+        semanticType: 'chapter',
+        originalHeadingText: pageLabel,
+        sourcePageReferences: [page.pageNumber],
+        confidence: 0.5,
+        reviewStatus: 'inferred',
         children: [],
       };
     });
@@ -925,6 +1599,7 @@ function buildTreeFromAllPageHeadings(
 
   for (const h of allHeadings) {
     itemCounter++;
+    const meta = classifyHeadingSemanticTypeAndLabel(h.title, h.level);
     const node: EpubTocItem = {
       id: `toc-h-${itemCounter}`,
       title: h.title,
@@ -932,6 +1607,12 @@ function buildTreeFromAllPageHeadings(
       targetPageNumber: h.pageNumber,
       targetHref: `page_${h.pageNumber}.xhtml#${h.anchorId}`,
       anchorId: h.anchorId,
+      semanticType: h.semanticType || meta.semanticType,
+      originalHeadingText: h.title,
+      explicitNumberLabel: h.explicitNumberLabel || meta.explicitNumberLabel,
+      sourcePageReferences: [h.pageNumber],
+      confidence: h.confidence ?? 0.88,
+      reviewStatus: 'confirmed',
       children: [],
     };
 
@@ -945,6 +1626,7 @@ function buildTreeFromAllPageHeadings(
         currentSection = null;
       } else if (h.level === 2) {
         if (currentPart) {
+          node.parentId = currentPart.id;
           currentPart.children.push(node);
         } else {
           tree.push(node);
@@ -953,8 +1635,10 @@ function buildTreeFromAllPageHeadings(
         currentSection = null;
       } else if (h.level === 3) {
         if (currentChapter) {
+          node.parentId = currentChapter.id;
           currentChapter.children.push(node);
         } else if (currentPart) {
+          node.parentId = currentPart.id;
           currentPart.children.push(node);
         } else {
           tree.push(node);
@@ -963,8 +1647,10 @@ function buildTreeFromAllPageHeadings(
       } else {
         // Level 4
         if (currentSection) {
+          node.parentId = currentSection.id;
           currentSection.children.push(node);
         } else if (currentChapter) {
+          node.parentId = currentChapter.id;
           currentChapter.children.push(node);
         } else {
           tree.push(node);
@@ -978,6 +1664,7 @@ function buildTreeFromAllPageHeadings(
         currentSection = null;
       } else if (h.level === 2) {
         if (currentChapter) {
+          node.parentId = currentChapter.id;
           currentChapter.children.push(node);
         } else {
           // If section comes before any Level 1 heading, keep at top level
@@ -989,8 +1676,10 @@ function buildTreeFromAllPageHeadings(
       } else {
         // Level 3 or 4
         if (currentSection) {
+          node.parentId = currentSection.id;
           currentSection.children.push(node);
         } else if (currentChapter) {
+          node.parentId = currentChapter.id;
           currentChapter.children.push(node);
         } else {
           tree.push(node);
@@ -1065,7 +1754,7 @@ export function calculateMaxDepth(nodes: EpubTocItem[]): number {
 }
 
 /**
- * Generates an elegant, publication-quality visual Table of Contents (toc.xhtml).
+ * Generates an elegant, publication-quality visual Table of Contents (toc.xhtml & contents.xhtml).
  * Features clean typographic hierarchy, responsive layout, and dark-mode compatibility.
  */
 export function generateVisualTocHtml(
@@ -1083,13 +1772,14 @@ export function generateVisualTocHtml(
       const hasChildren = node.children && node.children.length > 0;
       const subHtml = hasChildren ? `\n${renderList(node.children, depth + 1)}` : '';
       const levelClass = `level-${node.level}`;
+      const semanticAttr = node.semanticType ? ` data-semantic-type="${escapeXml(node.semanticType)}"` : '';
       const safeAnchor = node.anchorId ? escapeXml(node.anchorId) : '';
       const anchorAttr = safeAnchor ? ` data-anchor="${safeAnchor}"` : '';
       const safeHref = escapeXml(node.targetHref);
       const safeTitle = escapeXml(node.title);
 
       return `
-        <li class="toc-item ${levelClass}">
+        <li class="toc-item ${levelClass}"${semanticAttr}>
           <a href="${safeHref}" class="toc-link" data-target-page="${node.targetPageNumber}"${anchorAttr}>
             <span class="toc-text">${safeTitle}</span>
           </a>${subHtml}
@@ -1116,7 +1806,8 @@ export function generateVisualTocHtml(
 
 /**
  * Converts Markdown content into clean, valid XHTML elements.
- * Emits matching anchor IDs for every detected heading, ensuring guaranteed valid internal navigation.
+ * Emits matching anchor IDs for every detected heading and semantic chapter-opener blocks
+ * for confirmed chapters, ensuring guaranteed valid internal navigation and publication typography.
  */
 export function markdownToXhtml(
   markdown: string,
@@ -1126,11 +1817,13 @@ export function markdownToXhtml(
     pageNumber?: number;
     isTocPage?: boolean;
     allPages?: PageItem[];
+    skipPostNormalize?: boolean;
+    layoutBlocks?: PdfTextBlock[];
   } = {}
 ): string {
   if (!markdown) return '<p>...</p>';
 
-  const isToc = Boolean(options.isTocPage || isTableOfContentsText(markdown));
+  const isToc = options.isTocPage !== undefined ? Boolean(options.isTocPage) : isTableOfContentsText(markdown);
 
   // Ensure mixed-script OCR character errors (e.g. 'కిংবা' -> 'কিংবা') are corrected before XHTML conversion
   const scriptValidatedMarkdown = correctBengaliMixedScriptText(markdown);
@@ -1155,6 +1848,21 @@ export function markdownToXhtml(
   let figureCounter = 0;
   let headingCounter = 0;
   let activePageNumber = options.pageNumber || 1;
+  let hasEmittedChapterOpener = false;
+  let seenContentLinesOnPage = 0;
+  let usedIdsOnActivePage = new Set<string>();
+
+  // Lookup layoutBlocks for the current page if available
+  const resolvePageLayoutBlocks = (pageNum: number): PdfTextBlock[] | undefined => {
+    if (options.layoutBlocks && pageNum === (options.pageNumber || 1)) {
+      return options.layoutBlocks;
+    }
+    if (options.allPages && options.allPages.length > 0) {
+      const foundPage = options.allPages.find((p) => p.pageNumber === pageNum);
+      return foundPage?.layoutBlocks;
+    }
+    return undefined;
+  };
 
   const closeOpenListsAndTables = () => {
     if (inList) {
@@ -1189,11 +1897,41 @@ export function markdownToXhtml(
     }
 
     // Track consolidated page-boundary anchor markers (<span id="page_N" class="epub-page-anchor"></span>)
-    const pageAnchorMatch = trimmed.match(/^<span\s+id=["']page_(\d+)["']\s+class=["']epub-page-anchor["']\s*><\/span>$/i);
-    if (pageAnchorMatch) {
+    const boundaryPageNum = parseConsolidatedPageAnchorLine(trimmed);
+    if (boundaryPageNum !== null) {
       closeOpenListsAndTables();
-      activePageNumber = parseInt(pageAnchorMatch[1], 10);
+      activePageNumber = boundaryPageNum;
       headingCounter = 0;
+      usedIdsOnActivePage = new Set<string>();
+      seenContentLinesOnPage = 0;
+
+      // If the opening paragraph of this continuation page was merged across the page boundary
+      // prior to <span id="page_N">, the next block is no longer at the top of the source page.
+      if (options.allPages && options.allPages.length > 0) {
+        const sourcePage = options.allPages.find((p) => p.pageNumber === activePageNumber);
+        if (sourcePage) {
+          const srcCleaned = reconstructMultiColumnMarkdown(
+            stripPrintedPageNumbers(correctBengaliMixedScriptText(sourcePage.markdown), false)
+          ).reorderedText;
+          const firstSrcLine = srcCleaned
+            .split('\n')
+            .map((l) => l.trim())
+            .find((l) => l.length > 0 && parseConsolidatedPageAnchorLine(l) === null);
+          const nextConsolidatedLine = lines
+            .slice(i + 1)
+            .map((l) => l.trim())
+            .find((l) => l.length > 0 && parseConsolidatedPageAnchorLine(l) === null);
+          if (
+            firstSrcLine &&
+            nextConsolidatedLine &&
+            firstSrcLine !== nextConsolidatedLine &&
+            !nextConsolidatedLine.startsWith(firstSrcLine.slice(0, Math.min(16, firstSrcLine.length)))
+          ) {
+            seenContentLinesOnPage = 1;
+          }
+        }
+      }
+
       xhtmlParts.push(`<span id="page_${activePageNumber}" class="epub-page-anchor"></span>`);
       continue;
     }
@@ -1232,8 +1970,8 @@ export function markdownToXhtml(
       inTocList = false;
     }
 
-    // Check if line is Table of Contents header
-    if (/^(?:#+\s*)?(?:সূচিপত্র|সূচীপত্র|সূচি|table of contents|contents|فهرس)\b/i.test(trimmed)) {
+    // Check if line is Table of Contents header (only when rendering a TOC page)
+    if (isToc && isTableOfContentsLabel(trimmed)) {
       closeOpenListsAndTables();
       const cleanHeading = cleanHeadingText(trimmed.replace(/^#+\s*/, ''));
       xhtmlParts.push(`<h2 class="toc-title text-center font-bold">${formatInline(cleanHeading)}</h2>`);
@@ -1267,16 +2005,100 @@ export function markdownToXhtml(
       continue;
     }
 
-    // Intelligent Heading Detection with matching XML anchor IDs
-    const detectedHeading = detectHeadingFromLine(rawLine, activePageNumber, headingCounter + 1, false);
+    // Find surrounding non-empty lines for multi-signal heading detection
+    let prevNonEmptyLine = '';
+    for (let p = i - 1; p >= 0; p--) {
+      if (lines[p].trim() && !lines[p].includes('epub-page-anchor')) {
+        prevNonEmptyLine = lines[p].trim();
+        break;
+      }
+    }
+    let nextNonEmptyLine = '';
+    let nextNonEmptyIdx = -1;
+    for (let n = i + 1; n < lines.length; n++) {
+      if (lines[n].trim()) {
+        nextNonEmptyLine = lines[n].trim();
+        nextNonEmptyIdx = n;
+        break;
+      }
+    }
+
+    // Intelligent Heading Detection with matching XML anchor IDs and semantic Chapter Openers
+    const detectedHeading = detectHeadingFromLine(rawLine, activePageNumber, headingCounter + 1, false, {
+      prevNonEmptyLine,
+      nextNonEmptyLine,
+      isAtPageTop: seenContentLinesOnPage === 0,
+      layoutBlocks: resolvePageLayoutBlocks(activePageNumber),
+    });
     if (detectedHeading) {
       headingCounter++;
+      seenContentLinesOnPage++;
       closeOpenListsAndTables();
       if (inTocList) { xhtmlParts.push('</ul></nav></div>'); inTocList = false; }
 
+      let uniqueAnchorId = detectedHeading.anchorId;
+      if (usedIdsOnActivePage.has(uniqueAnchorId)) {
+        let suffix = 2;
+        while (usedIdsOnActivePage.has(`${uniqueAnchorId}-${suffix}`)) {
+          suffix++;
+        }
+        uniqueAnchorId = `${uniqueAnchorId}-${suffix}`;
+      }
+      usedIdsOnActivePage.add(uniqueAnchorId);
+
+      // Pair two-line chapter headers (e.g. "প্রথম অধ্যায়" + "বাবরের ভারত অভিযান") consistently with extractHeadingsFromMarkdown
+      let pairedSubtitle: string | null = null;
+      if (
+        !isToc &&
+        detectedHeading.isStandaloneChapterNumberLine &&
+        nextNonEmptyIdx !== -1 &&
+        nextNonEmptyIdx - i <= 2
+      ) {
+        pairedSubtitle = extractPairedChapterSubtitle(nextNonEmptyLine);
+      }
+
+      // Emit a semantic Chapter Opener for the primary confirmed Level-1 chapter/part/front-matter/back-matter heading
+      if (
+        !isToc &&
+        !hasEmittedChapterOpener &&
+        detectedHeading.level === 1 &&
+        detectedHeading.isConfirmedChapter !== false
+      ) {
+        hasEmittedChapterOpener = true;
+        if (pairedSubtitle) {
+          i = nextNonEmptyIdx; // Consume the paired subtitle line
+          xhtmlParts.push(
+            `<header class="chapter-opener" epub:type="header">\n  <p class="chapter-number-label text-center">${formatInline(detectedHeading.title)}</p>\n  <h1 id="${uniqueAnchorId}" class="chapter-title text-center">${formatInline(pairedSubtitle)}</h1>\n  <hr class="chapter-opener-divider" />\n</header>`
+          );
+        } else {
+          xhtmlParts.push(
+            `<header class="chapter-opener" epub:type="header">\n  <h1 id="${uniqueAnchorId}" class="chapter-title text-center">${formatInline(detectedHeading.title)}</h1>\n  <hr class="chapter-opener-divider" />\n</header>`
+          );
+        }
+        continue;
+      }
+
+      let renderedHeadingTitle = detectedHeading.title;
+      if (pairedSubtitle) {
+        i = nextNonEmptyIdx; // Keep headingCounter synchronized with extractHeadingsFromMarkdown
+        renderedHeadingTitle = `${detectedHeading.title}: ${pairedSubtitle}`;
+      }
+
       const tag = `h${detectedHeading.level}`;
-      const centerClass = detectedHeading.isCenter || inCenterBlock ? ' class="text-center"' : '';
-      xhtmlParts.push(`<${tag} id="${detectedHeading.anchorId}"${centerClass}>${formatInline(detectedHeading.title)}</${tag}>`);
+      const semanticHeadingClass =
+        detectedHeading.level === 1
+          ? 'chapter-title'
+          : detectedHeading.level === 2
+          ? 'section-heading'
+          : 'subsection-heading';
+      const classes = [
+        semanticHeadingClass,
+        detectedHeading.isCenter || inCenterBlock ? 'text-center' : '',
+      ]
+        .filter(Boolean)
+        .join(' ');
+      const classAttr = classes ? ` class="${classes}"` : '';
+      xhtmlParts.push(`<${tag} id="${uniqueAnchorId}"${classAttr}>${formatInline(renderedHeadingTitle)}</${tag}>`);
       continue;
     }
 
@@ -1294,6 +2116,7 @@ export function markdownToXhtml(
 
     // Blockquote
     if (trimmed.startsWith('> ')) {
+      seenContentLinesOnPage++;
       if (inList) { xhtmlParts.push('</ul>'); inList = false; }
       if (inOrderedList) { xhtmlParts.push('</ol>'); inOrderedList = false; }
       if (inTable) { xhtmlParts.push('</tbody></table>'); inTable = false; }
@@ -1311,6 +2134,7 @@ export function markdownToXhtml(
     // Ordered lists (1. or ১. or 1) or ১))
     const orderedListMatch = trimmed.match(/^([০-৯0-9]+)[\.\)]\s+(.+)$/);
     if (orderedListMatch) {
+      seenContentLinesOnPage++;
       if (inList) { xhtmlParts.push('</ul>'); inList = false; }
       if (inBlockquote) { xhtmlParts.push('</blockquote>'); inBlockquote = false; }
       if (inTable) { xhtmlParts.push('</tbody></table>'); inTable = false; }
@@ -1327,6 +2151,7 @@ export function markdownToXhtml(
 
     // Markdown tables: | cell | cell |
     if (trimmed.startsWith('|') && trimmed.endsWith('|') && trimmed.length > 2) {
+      seenContentLinesOnPage++;
       if (inList) { xhtmlParts.push('</ul>'); inList = false; }
       if (inOrderedList) { xhtmlParts.push('</ol>'); inOrderedList = false; }
       if (inBlockquote) { xhtmlParts.push('</blockquote>'); inBlockquote = false; }
@@ -1353,6 +2178,7 @@ export function markdownToXhtml(
 
     // Bulleted lists
     if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
+      seenContentLinesOnPage++;
       if (inOrderedList) { xhtmlParts.push('</ol>'); inOrderedList = false; }
       if (!inList) {
         xhtmlParts.push('<ul>');
@@ -1367,6 +2193,7 @@ export function markdownToXhtml(
 
     // Footnote
     if (trimmed.startsWith('[^') && trimmed.includes(']:')) {
+      seenContentLinesOnPage++;
       xhtmlParts.push(`<p class="footnote"><em>${formatInline(trimmed)}</em></p>`);
       continue;
     }
@@ -1407,19 +2234,32 @@ export function markdownToXhtml(
         ? figDataStr
         : (options.pageNumber ? `figures/page_${options.pageNumber}_fig_${figureCounter}.${figExt}` : '');
 
-      // Check for optional figure caption (from currentFig.caption or immediately following caption line)
+      // Check for optional genuine figure caption (from currentFig.caption or immediately following caption line)
+      // Automatically generated generic placeholders like "চিত্র" are strictly excluded.
       let captionText = currentFig?.caption?.trim() || '';
-      if (!captionText && i + 1 < lines.length) {
-        const nextTrimmed = lines[i + 1].trim();
-        if (
-          /^(?:\*|_)?(?:চিত্র|ছবি|চিত্রাঙ্কন|ডায়াগ্রাম|Figure|Fig\.|Photo|Plate)\s*[০-৯0-9:.—–-]\s*.+/i.test(
+      if (isGenericFigurePlaceholderCaption(captionText)) {
+        captionText = '';
+      }
+
+      let lookaheadIdx = i + 1;
+      if (lookaheadIdx < lines.length && !lines[lookaheadIdx].trim() && lookaheadIdx + 1 < lines.length) {
+        lookaheadIdx++;
+      }
+      if (lookaheadIdx < lines.length) {
+        const nextTrimmed = lines[lookaheadIdx].trim();
+        if (nextTrimmed && isGenericFigurePlaceholderCaption(nextTrimmed)) {
+          i = lookaheadIdx; // consume and discard standalone generic placeholder line (e.g. "চিত্র")
+        } else if (
+          !captionText &&
+          /^(?:\*|_)?(?:চিত্র|ছবি|চিত্রাঙ্কন|ডায়াগ্রাম|ডায়াগ্রাম|Figure|Fig\.|Photo|Plate)\s*(?:[০-৯0-9]+\s*[:.—–-]?\s*\S+|[:.—–-]\s*\S+)/i.test(
             nextTrimmed
           )
         ) {
           captionText = nextTrimmed.replace(/^(?:\*|_)+|(?:\*|_)+$/g, '').trim();
-          i++; // consume caption line into <figcaption>
+          i = lookaheadIdx; // consume genuine caption line into <figcaption>
         }
       }
+
       const figcaptionHtml = captionText
         ? `\n            <figcaption class="figure-caption">${formatInline(captionText)}</figcaption>`
         : '';
@@ -1427,15 +2267,13 @@ export function markdownToXhtml(
       if (imgSrc) {
         xhtmlParts.push(`
           <figure class="${figContainerClass}">
-            <img src="${imgSrc}" alt="${escapeXml(captionText || 'চিত্র')}" class="book-img ${imgAlignClass} max-h-80 max-w-full object-contain my-2" />${figcaptionHtml}
+            <img src="${imgSrc}" alt="${escapeXml(captionText)}" class="book-img ${imgAlignClass} max-h-80 max-w-full object-contain my-2" />${figcaptionHtml}
           </figure>
         `);
       } else {
         xhtmlParts.push(`
           <figure class="${figContainerClass}">
-            <div class="figure-frame py-6 bg-slate-100 dark:bg-slate-800 rounded-lg text-slate-500 text-xs inline-block px-8">
-              <span class="figure-label font-medium">[চিত্র]</span>
-            </div>${figcaptionHtml}
+            <div class="figure-frame py-6 bg-slate-100 dark:bg-slate-800 rounded-lg text-slate-500 text-xs inline-block px-8"></div>${figcaptionHtml}
           </figure>
         `);
       }
@@ -1445,25 +2283,32 @@ export function markdownToXhtml(
     // Markdown image syntax: ![alt](src)
     const mdImgMatch = trimmed.match(/^!\[([^\]]*)\]\(([^)]+)\)$/);
     if (mdImgMatch) {
-      const alt = mdImgMatch[1] || 'চিত্র';
+      const rawAlt = (mdImgMatch[1] || '').trim();
+      const alt = isGenericFigurePlaceholderCaption(rawAlt) ? '' : rawAlt;
       let src = mdImgMatch[2];
       if (options.isPreview && !src.startsWith('data:') && !src.startsWith('http')) {
-        const found = figures.find((f) => f.caption === alt || f.imageUrl);
+        const found = figures.find((f) => (alt && f.caption === alt) || f.imageUrl);
         if (found && (found.imageUrl || found.dataUrl)) {
           src = found.imageUrl || found.dataUrl || src;
         }
       }
 
       let captionText = '';
-      if (i + 1 < lines.length) {
-        const nextTrimmed = lines[i + 1].trim();
-        if (
-          /^(?:\*|_)?(?:চিত্র|ছবি|চিত্রাঙ্কন|ডায়াগ্রাম|Figure|Fig\.|Photo|Plate)\s*[০-৯0-9:.—–-]\s*.+/i.test(
+      let lookaheadIdx = i + 1;
+      if (lookaheadIdx < lines.length && !lines[lookaheadIdx].trim() && lookaheadIdx + 1 < lines.length) {
+        lookaheadIdx++;
+      }
+      if (lookaheadIdx < lines.length) {
+        const nextTrimmed = lines[lookaheadIdx].trim();
+        if (nextTrimmed && isGenericFigurePlaceholderCaption(nextTrimmed)) {
+          i = lookaheadIdx;
+        } else if (
+          /^(?:\*|_)?(?:চিত্র|ছবি|চিত্রাঙ্কন|ডায়াগ্রাম|ডায়াগ্রাম|Figure|Fig\.|Photo|Plate)\s*(?:[০-৯0-9]+\s*[:.—–-]?\s*\S+|[:.—–-]\s*\S+)/i.test(
             nextTrimmed
           )
         ) {
           captionText = nextTrimmed.replace(/^(?:\*|_)+|(?:\*|_)+$/g, '').trim();
-          i++;
+          i = lookaheadIdx;
         }
       }
       const figcaptionHtml = captionText
@@ -1472,7 +2317,7 @@ export function markdownToXhtml(
 
       xhtmlParts.push(`
         <figure class="book-figure fig-left text-left my-4">
-          <img src="${src}" alt="${escapeXml(alt)}" class="book-img mr-auto max-h-80 max-w-full object-contain my-2" />${figcaptionHtml}
+          <img src="${src}" alt="${escapeXml(alt || captionText)}" class="book-img mr-auto max-h-80 max-w-full object-contain my-2" />${figcaptionHtml}
         </figure>
       `);
       continue;
@@ -1483,6 +2328,7 @@ export function markdownToXhtml(
     if (singleCenterMatch) {
       const innerText = singleCenterMatch[1].trim();
       if (innerText) {
+        seenContentLinesOnPage++;
         xhtmlParts.push(`<p class="text-center">${formatInline(innerText)}</p>`);
       }
       continue;
@@ -1493,6 +2339,7 @@ export function markdownToXhtml(
     if (singleRightMatch) {
       const innerText = singleRightMatch[1].trim();
       if (innerText) {
+        seenContentLinesOnPage++;
         xhtmlParts.push(`<p class="text-right">${formatInline(innerText)}</p>`);
       }
       continue;
@@ -1533,30 +2380,75 @@ export function markdownToXhtml(
       const combinedClasses = [alignClass, indentClass].filter(Boolean).join(' ');
       const classAttr = combinedClasses ? ` class="${combinedClasses}"` : '';
 
+      seenContentLinesOnPage++;
       xhtmlParts.push(`<p${classAttr}>${formatInline(inner)}</p>`);
       continue;
     }
 
     // Active multi-line block alignments
     if (inCenterBlock) {
+      seenContentLinesOnPage++;
       xhtmlParts.push(`<p class="text-center">${formatInline(trimmed)}</p>`);
       continue;
     }
     if (inRightBlock) {
+      seenContentLinesOnPage++;
       xhtmlParts.push(`<p class="text-right">${formatInline(trimmed)}</p>`);
       continue;
     }
 
     // Indentation detection from leading whitespace
     if (rawLine.startsWith('    ') || rawLine.startsWith('\t')) {
+      seenContentLinesOnPage++;
       xhtmlParts.push(`<p class="indent-line">${formatInline(trimmed)}</p>`);
       continue;
     } else if (rawLine.startsWith('  ')) {
+      seenContentLinesOnPage++;
       xhtmlParts.push(`<p class="indent-1">${formatInline(trimmed)}</p>`);
       continue;
     }
 
+    // Poetry / Stanza line detection: preserve tight intra-stanza line spacing and explicit stanza breaks
+    const prevRaw = i > 0 ? lines[i - 1].trim() : '';
+    const nextRaw = i + 1 < lines.length ? lines[i + 1].trim() : '';
+    const isPlainVerseCandidate = (s: string) =>
+      Boolean(s) &&
+      !s.startsWith('#') &&
+      !s.startsWith('|') &&
+      !s.startsWith('>') &&
+      !s.startsWith('- ') &&
+      !s.startsWith('* ') &&
+      !s.includes('epub-page-anchor') &&
+      !s.includes('[IMAGE_FIGURE:');
+
+    if (
+      isPlainVerseCandidate(trimmed) &&
+      (isPlainVerseCandidate(prevRaw) || isPlainVerseCandidate(nextRaw) || trimmed.includes('॥'))
+    ) {
+      // Collect contiguous non-empty lines of this stanza
+      let startIdx = i;
+      while (startIdx > 0 && isPlainVerseCandidate(lines[startIdx - 1].trim())) {
+        startIdx--;
+      }
+      let endIdx = i;
+      while (endIdx + 1 < lines.length && isPlainVerseCandidate(lines[endIdx + 1].trim())) {
+        endIdx++;
+      }
+      const stanzaCandidate = lines.slice(startIdx, endIdx + 1).join('\n');
+      if (
+        isPoetryOrVerseBlock(stanzaCandidate) ||
+        isUnmarkedProsePoetryBlock(stanzaCandidate).isProsePoetry
+      ) {
+        const isLastLineOfStanza = i === endIdx;
+        const stanzaClass = isLastLineOfStanza ? 'verse-line stanza-end' : 'verse-line';
+        seenContentLinesOnPage++;
+        xhtmlParts.push(`<p class="${stanzaClass}">${formatInline(trimmed)}</p>`);
+        continue;
+      }
+    }
+
     // Standard paragraph
+    seenContentLinesOnPage++;
     xhtmlParts.push(`<p>${formatInline(trimmed)}</p>`);
   }
 
@@ -1565,7 +2457,11 @@ export function markdownToXhtml(
   if (inRightBlock) xhtmlParts.push('</div>');
   if (inTocList) xhtmlParts.push('</ul></nav></div>');
 
-  const initialXhtml = normalizeHtmlToXhtml(xhtmlParts.join('\n'));
+  const joinedXhtml = xhtmlParts.join('\n');
+  if (options.skipPostNormalize) {
+    return joinedXhtml;
+  }
+  const initialXhtml = normalizeHtmlToXhtml(joinedXhtml);
   const { normalizedXhtml } = normalizeEpubLayoutXhtml(initialXhtml);
   return normalizeHtmlToXhtml(normalizedXhtml);
 }
@@ -1595,12 +2491,259 @@ export function formatInline(text: string): string {
     .join('');
 }
 
+interface EmittedChapterHeadingInfo {
+  id: string;
+  level: number;
+  text: string;
+  combinedText: string;
+}
+
+function extractEmittedIdsAndHeadings(xhtml: string): {
+  ids: Set<string>;
+  headings: EmittedChapterHeadingInfo[];
+} {
+  const ids = new Set<string>();
+  const idRegex = /\bid=["']([^"']+)["']/gi;
+  let idMatch: RegExpExecArray | null;
+  while ((idMatch = idRegex.exec(xhtml)) !== null) {
+    if (idMatch[1]) ids.add(idMatch[1]);
+  }
+
+  const headings: EmittedChapterHeadingInfo[] = [];
+  // Extract chapter opener headers with optional chapter-number-label + h1
+  const openerRegex = /<header\b[^>]*class=["'][^"']*chapter-opener[^"']*["'][^>]*>([\s\S]*?)<\/header>/gi;
+  let openerMatch: RegExpExecArray | null;
+  const handledHeadingIds = new Set<string>();
+
+  while ((openerMatch = openerRegex.exec(xhtml)) !== null) {
+    const inner = openerMatch[1];
+    const labelMatch = inner.match(/<p\b[^>]*class=["'][^"']*chapter-number-label[^"']*["'][^>]*>([\s\S]*?)<\/p>/i);
+    const h1Match = inner.match(/<h1\b[^>]*id=["']([^"']+)["'][^>]*>([\s\S]*?)<\/h1>/i);
+    if (h1Match) {
+      const id = h1Match[1];
+      const h1Text = h1Match[2].replace(/<[^>]+>/g, '').trim();
+      const labelText = labelMatch ? labelMatch[1].replace(/<[^>]+>/g, '').trim() : '';
+      const combinedText = labelText ? `${labelText}: ${h1Text}` : h1Text;
+      handledHeadingIds.add(id);
+      headings.push({
+        id,
+        level: 1,
+        text: h1Text,
+        combinedText,
+      });
+    }
+  }
+
+  const headingRegex = /<h([1-4])\b[^>]*id=["']([^"']+)["'][^>]*>([\s\S]*?)<\/h\1>/gi;
+  let hMatch: RegExpExecArray | null;
+  while ((hMatch = headingRegex.exec(xhtml)) !== null) {
+    const level = parseInt(hMatch[1], 10);
+    const id = hMatch[2];
+    if (handledHeadingIds.has(id)) continue;
+    const text = hMatch[3].replace(/<[^>]+>/g, '').trim();
+    headings.push({
+      id,
+      level,
+      text,
+      combinedText: text,
+    });
+  }
+
+  return { ids, headings };
+}
+
+/**
+ * Synchronizes every TOC node in the tree against the actual emitted XHTML chapter files and heading IDs.
+ * Ensures that:
+ * 1. Valid `page_N` anchors and page-specific `toc-h-pN-...` heading anchors that exist in the target XHTML file are strictly preserved.
+ * 2. Consolidated continuation page `page_N` anchors are never overwritten by `fileHeadings[0].id`.
+ * 3. Partial/short substring matches never hijack a TOC entry to a distant chapter file.
+ * 4. Genuinely missing targets are marked `unresolved` rather than silently redirected to an unrelated chapter heading.
+ */
+export function synchronizeTocTreeWithGeneratedChapters(
+  nodes: EpubTocItem[],
+  emittedIdsByFile: Map<string, Set<string>>,
+  emittedHeadingsByFile: Map<string, EmittedChapterHeadingInfo[]>,
+  fallbackContentHref: string,
+  unresolvedWarnings?: string[]
+): EpubTocItem[] {
+  const emittedFiles = Array.from(emittedIdsByFile.keys());
+  if (emittedFiles.length === 0) return nodes;
+
+  const extractHeadingPageNumber = (headingId: string): number | null => {
+    const m = headingId.match(/^toc-h-p(\d+)-/);
+    return m ? parseInt(m[1], 10) : null;
+  };
+
+  const findHeadingMatchInFile = (
+    file: string,
+    searchTitle: string,
+    expectedPageNumber?: number,
+    expectedLevel?: 1 | 2 | 3 | 4
+  ): EmittedChapterHeadingInfo | undefined => {
+    const list = emittedHeadingsByFile.get(file);
+    if (!list || list.length === 0) return undefined;
+
+    let bestOnExpectedPage: { heading: EmittedChapterHeadingInfo; score: number } | undefined;
+    let bestInSameChapterWindow: { heading: EmittedChapterHeadingInfo; score: number } | undefined;
+
+    for (const h of list) {
+      const scoreText = scoreTocToHeadingMatch(searchTitle, h.text, expectedLevel, h.level);
+      const scoreCombined = scoreTocToHeadingMatch(searchTitle, h.combinedText, expectedLevel, h.level);
+      const score = Math.max(scoreText, scoreCombined);
+      if (score < 0.78) continue;
+
+      const hPage = extractHeadingPageNumber(h.id);
+      if (expectedPageNumber !== undefined && hPage !== null) {
+        if (hPage === expectedPageNumber) {
+          if (!bestOnExpectedPage || score > bestOnExpectedPage.score) {
+            bestOnExpectedPage = { heading: h, score };
+          }
+        } else if (Math.abs(hPage - expectedPageNumber) <= 2 && score >= 0.85) {
+          if (!bestInSameChapterWindow || score > bestInSameChapterWindow.score) {
+            bestInSameChapterWindow = { heading: h, score };
+          }
+        }
+      } else {
+        if (!bestInSameChapterWindow || score > bestInSameChapterWindow.score) {
+          bestInSameChapterWindow = { heading: h, score };
+        }
+      }
+    }
+
+    return bestOnExpectedPage?.heading || bestInSameChapterWindow?.heading;
+  };
+
+  const findEmittedFileOwningPage = (pageNum: number): string | undefined => {
+    const directFile = `page_${pageNum}.xhtml`;
+    if (emittedIdsByFile.has(directFile)) return directFile;
+    const pageAnchor = `page_${pageNum}`;
+    const headingPrefix = `toc-h-p${pageNum}-`;
+    for (const [file, ids] of emittedIdsByFile.entries()) {
+      if (ids.has(pageAnchor)) return file;
+      for (const id of ids) {
+        if (id.startsWith(headingPrefix)) return file;
+      }
+    }
+    return undefined;
+  };
+
+  const syncNode = (node: EpubTocItem): EpubTocItem => {
+    const [rawFile, rawHash] = (node.targetHref || '').split('#');
+    let targetFile = rawFile || `page_${node.targetPageNumber}.xhtml`;
+    let wasMissingTargetFile = false;
+
+    if (!emittedIdsByFile.has(targetFile)) {
+      const owningFile = findEmittedFileOwningPage(node.targetPageNumber);
+      if (owningFile) {
+        targetFile = owningFile;
+      } else {
+        wasMissingTargetFile = true;
+        const targetNumMatch = targetFile.match(/page_(\d+)\.xhtml/);
+        const targetNum = targetNumMatch ? parseInt(targetNumMatch[1], 10) : node.targetPageNumber;
+        let bestFile = fallbackContentHref;
+        let bestDiff = Infinity;
+        for (const candidateFile of emittedFiles) {
+          const m = candidateFile.match(/page_(\d+)\.xhtml/);
+          if (m) {
+            const pNum = parseInt(m[1], 10);
+            const diff = Math.abs(pNum - targetNum);
+            if (diff < bestDiff) {
+              bestDiff = diff;
+              bestFile = candidateFile;
+            }
+          }
+        }
+        targetFile = bestFile;
+      }
+    }
+
+    const fileIds = emittedIdsByFile.get(targetFile) || new Set<string>();
+    let resolvedAnchorId: string | undefined = rawHash || node.anchorId;
+    let updatedReviewStatus = node.reviewStatus;
+
+    // 1. If the node already has a valid anchor ID (either `toc-h-pN-...` or `page_N`) that exists in targetFile, preserve it!
+    if (resolvedAnchorId && fileIds.has(resolvedAnchorId)) {
+      // Valid anchor exists in targetFile — keep it intact.
+    } else {
+      // 2. Search headings within targetFile using conservative multi-signal matching
+      const matchedInTarget = findHeadingMatchInFile(
+        targetFile,
+        node.title,
+        node.targetPageNumber,
+        node.level
+      );
+      if (matchedInTarget) {
+        resolvedAnchorId = matchedInTarget.id;
+      } else {
+        // 3. Preserve valid `page_N` anchor if present in targetFile (critical for consolidated continuation pages)
+        const pageAnchor = `page_${node.targetPageNumber}`;
+        if (fileIds.has(pageAnchor)) {
+          resolvedAnchorId = pageAnchor;
+        } else {
+          // 4. Only use fileHeadings[0].id if targetFile IS the starting page of this chapter (never a continuation page)
+          //    and there is no conflicting chapter number.
+          const fileHeadings = emittedHeadingsByFile.get(targetFile) || [];
+          const isStartingPageOfFile = targetFile === `page_${node.targetPageNumber}.xhtml` && !wasMissingTargetFile;
+          const firstHeading = fileHeadings[0];
+          const firstHeadingPage = firstHeading ? extractHeadingPageNumber(firstHeading.id) : null;
+          const tocProfile = buildHeadingMatchProfile(node.title);
+          const firstHeadingProfile = firstHeading
+            ? buildHeadingMatchProfile(firstHeading.combinedText || firstHeading.text)
+            : null;
+          const hasNumberConflict =
+            firstHeadingProfile ? hasConflictingChapterNumbers(tocProfile, firstHeadingProfile) : true;
+
+          if (
+            isStartingPageOfFile &&
+            node.level === 1 &&
+            firstHeading &&
+            firstHeading.level === 1 &&
+            (firstHeadingPage === null || firstHeadingPage === node.targetPageNumber) &&
+            !hasNumberConflict &&
+            (!rawHash && !node.anchorId)
+          ) {
+            resolvedAnchorId = firstHeading.id;
+          } else {
+            resolvedAnchorId = undefined;
+            if (rawHash || node.anchorId || wasMissingTargetFile) {
+              updatedReviewStatus = 'unresolved';
+              if (unresolvedWarnings) {
+                unresolvedWarnings.push(
+                  `TOC entry "${node.title}" (target page ${node.targetPageNumber}) could not resolve anchor "${rawHash || node.anchorId || 'page_' + node.targetPageNumber}" in ${targetFile}.`
+                );
+              }
+            }
+          }
+        }
+      }
+    }
+
+    const updatedHref = resolvedAnchorId ? `${targetFile}#${resolvedAnchorId}` : targetFile;
+    const syncedChildren =
+      node.children && node.children.length > 0
+        ? node.children.map((child) => syncNode(child))
+        : [];
+
+    return {
+      ...node,
+      anchorId: resolvedAnchorId,
+      targetHref: updatedHref,
+      reviewStatus: updatedReviewStatus,
+      children: syncedChildren,
+    };
+  };
+
+  return nodes.map((n) => syncNode(n));
+}
+
 export interface EpubGenerationResult {
   blob: Blob;
   filename: string;
   diagnostics?: TocDiagnostics;
   validationReport?: PackageValidationReport;
   layoutReport?: LayoutCleanupReport;
+  canonicalOutline?: CanonicalDocumentOutline;
 }
 
 /**
@@ -1613,8 +2756,10 @@ export async function generateEpubBlob(
   coverImageBase64?: string | null,
   preferredFont: 'noto' | 'kalpurush' | 'solaiman' | 'siliguri' = 'noto',
   structureConfig?: StructureConfig,
-  pdfOutline?: PdfOutlineItem[]
+  pdfOutline?: PdfOutlineItem[],
+  options?: { smartSpacing?: boolean }
 ): Promise<EpubGenerationResult> {
+  const smartSpacingEnabled = options?.smartSpacing !== false;
   const zip = new JSZip();
 
   // 1. mimetype (MUST be first entry, UNCOMPRESSED / STORE method for IDPF validator compliance)
@@ -1654,7 +2799,7 @@ export async function generateEpubBlob(
   };
   const chosenFontFamily = fontStacks[preferredFont] || fontStacks.noto;
 
-  // CSS Stylesheet optimized for all major e-readers and devices
+  // CSS Stylesheet optimized for all major e-readers and devices with Bengali-safe typography
   const css = `
 @charset "utf-8";
 
@@ -1674,6 +2819,8 @@ body {
   background-color: #ffffff;
   text-align: justify;
   /* Prevent broken Bengali conjuncts (যুক্তাক্ষর) */
+  letter-spacing: 0 !important;
+  font-variant-ligatures: normal;
   word-break: normal !important;
   overflow-wrap: break-word !important;
   hyphens: none !important;
@@ -1686,6 +2833,7 @@ h1, h2, h3, h4 {
   font-weight: bold;
   line-height: 1.35;
   color: #111827;
+  letter-spacing: 0 !important;
   page-break-after: avoid;
   break-after: avoid;
   word-break: normal !important;
@@ -1694,23 +2842,23 @@ h1, h2, h3, h4 {
 }
 
 h1 {
-  font-size: 1.8em;
+  font-size: 1.75em;
   text-align: center;
-  margin-top: 1.5em;
-  margin-bottom: 0.8em;
+  margin-top: 1.4em;
+  margin-bottom: 0.7em;
   border-bottom: 1.5px solid #e5e7eb;
   padding-bottom: 0.3em;
 }
 
-h2 {
-  font-size: 1.4em;
-  margin-top: 1.3em;
-  margin-bottom: 0.6em;
+h2, .section-heading {
+  font-size: 1.38em;
+  margin-top: 1.35em;
+  margin-bottom: 0.55em;
   color: #1f2937;
 }
 
-h3 {
-  font-size: 1.18em;
+h3, .subsection-heading {
+  font-size: 1.16em;
   margin-top: 1.1em;
   margin-bottom: 0.4em;
   color: #374151;
@@ -1723,10 +2871,64 @@ h4 {
   color: #4b5563;
 }
 
+/* ========================================================
+   Publication-Grade Chapter Opener Block
+   ======================================================== */
+.chapter-opener {
+  margin-top: 2.2em;
+  margin-bottom: 1.8em;
+  padding: 0.4em 0.5em 0.2em 0.5em;
+  text-align: center;
+  page-break-inside: avoid;
+  break-inside: avoid;
+  page-break-after: avoid;
+  break-after: avoid;
+}
+
+.chapter-number-label {
+  font-size: 0.95em;
+  font-weight: 600;
+  color: #4b5563;
+  text-align: center !important;
+  text-indent: 0 !important;
+  letter-spacing: 0 !important;
+  margin: 0 0 0.35em 0 !important;
+  line-height: 1.4;
+}
+
+.chapter-opener h1,
+.chapter-opener .chapter-title {
+  font-size: 1.8em;
+  font-weight: 700;
+  line-height: 1.35;
+  text-align: center !important;
+  text-indent: 0 !important;
+  letter-spacing: 0 !important;
+  margin: 0.1em 0 0.55em 0 !important;
+  padding-bottom: 0;
+  border-bottom: none;
+  color: #111827;
+}
+
+.chapter-opener-divider {
+  width: 4.5em;
+  height: 0;
+  border: none;
+  border-top: 2px solid #9ca3af;
+  margin: 0.65em auto 0.2em auto;
+}
+
 p {
   margin-top: 0;
   margin-bottom: 1em;
   text-indent: 1.5em;
+}
+
+/* Opening paragraph immediately following a chapter opener or heading has clean flush-left start */
+.chapter-opener + p,
+h1 + p,
+h2 + p {
+  text-indent: 0;
 }
 
 /* Alignments */
@@ -1868,6 +3070,19 @@ p {
   height: 0;
   margin: 0;
   padding: 0;
+  line-height: 0;
+  font-size: 0;
+}
+
+.verse-line, p.verse-line {
+  text-indent: 0 !important;
+  margin-top: 0 !important;
+  margin-bottom: 0.2em !important;
+  line-height: 1.75;
+}
+
+.stanza-end, p.stanza-end {
+  margin-bottom: 1.15em !important;
 }
 
 .cover-page {
@@ -1899,7 +3114,7 @@ p {
 .toc-title {
   font-size: 1.8em;
   font-weight: 700;
-  letter-spacing: 0.03em;
+  letter-spacing: 0 !important;
   margin: 0.5em 0 0.25em 0;
   text-align: center;
   border-bottom: none;
@@ -2028,6 +3243,7 @@ p {
   text-decoration: none !important;
   padding: 0.2em 0.3em;
   line-height: 1.5;
+  letter-spacing: 0 !important;
   border-radius: 4px;
   transition: all 0.15s ease;
   cursor: pointer;
@@ -2040,6 +3256,7 @@ p {
 
 .toc-text {
   display: inline;
+  letter-spacing: 0 !important;
   word-break: normal;
   overflow-wrap: break-word;
 }
@@ -2050,8 +3267,14 @@ p {
     background-color: #121212;
     color: #e5e5e5;
   }
-  h1, h2, h3, h4 {
+  h1, h2, h3, h4, .chapter-opener h1, .chapter-opener .chapter-title {
     color: #f3f4f6;
+  }
+  .chapter-number-label {
+    color: #9ca3af;
+  }
+  .chapter-opener-divider {
+    border-top-color: #4b5563;
   }
   .toc-title {
     color: #f9fafb !important;
@@ -2085,19 +3308,15 @@ p {
   const validPages = sanitizedPages.filter((p) => p.status !== 'excluded' && p.markdown.trim().length > 0);
 
   // Master Table of Contents extraction pipeline (Dedicated, Stage A, B, C, D, Fallback)
-  const tocResult = extractAuthoritativeTocTree(validPages, {
+  let tocResult = extractAuthoritativeTocTree(validPages, {
     pdfOutline,
     structureConfig,
     bookDetails,
   });
   const identifiedTocPageNums = new Set(tocResult.tocPages);
-
-  // Also include any pages explicitly marked isTocPage or detected by multi-signal heuristics
-  validPages.forEach((p) => {
-    if (p && (p.isTocPage || isLikelyTocPage(p, validPages, structureConfig))) {
-      identifiedTocPageNums.add(p.pageNumber);
-    }
-  });
+  for (const pNum of detectTocPages(validPages, structureConfig)) {
+    identifiedTocPageNums.add(pNum);
+  }
 
   // Intelligent Document Layout Reconstruction & Gap Removal Stage:
   // 1. Strips repeated running headers/footers & artificial page-break elements
@@ -2110,10 +3329,27 @@ p {
     pdfOutline,
     tocTree: tocResult.tree,
     identifiedTocPageNums,
+    smartSpacing: smartSpacingEnabled,
   });
 
+  // If layout reconstruction stripped running headers/footers or reordered multi-column text,
+  // re-resolve the TOC tree against cleanedPages (merging TOC pages back in if they were filtered out)
+  // so heading counters on cleaned pages match the generated XHTML 100%.
+  if (
+    layoutReconstruction.report.runningHeadersFootersRemoved > 0 ||
+    layoutReconstruction.report.multiColumnPagesReordered > 0
+  ) {
+    const cleanedByPageNum = new Map(layoutReconstruction.cleanedPages.map((p) => [p.pageNumber, p]));
+    const pagesForUpdatedToc = validPages.map((p) => cleanedByPageNum.get(p.pageNumber) || p);
+    tocResult = extractAuthoritativeTocTree(pagesForUpdatedToc, {
+      pdfOutline,
+      structureConfig,
+      bookDetails,
+    });
+  }
+
   // Remap TOC tree links if any continuation page was consolidated into its parent chapter file
-  const tocTree = remapTocTreeForConsolidatedPages(
+  const remappedTocTree = remapTocTreeForConsolidatedPages(
     tocResult.tree,
     layoutReconstruction.pageToSectionFileMap
   );
@@ -2140,21 +3376,7 @@ p {
     oebps.file('cover.xhtml', coverXhtml);
   }
 
-  // Generate Standalone Visual Table of Contents (toc.xhtml) in spine
-  const visualTocContent = generateVisualTocHtml(tocTree, bookTitle, author, lang);
-  const normalizedVisualToc = normalizeHtmlToXhtml(visualTocContent);
-  const visualTocXhtml = buildCompleteXhtmlDocument(
-    `${tocTitle} - ${bookTitle}`,
-    normalizedVisualToc,
-    lang
-  );
-  const tocCheck = validateXmlString(visualTocXhtml);
-  if (!tocCheck.isValid) {
-    throw new Error(`toc.xhtml XML validation failed: ${tocCheck.error}`);
-  }
-  oebps.file('toc.xhtml', visualTocXhtml);
-
-  // Chapters / Pages
+  // Chapters / Pages manifest & spine setup
   const manifestItems: string[] = [];
   const spineItems: string[] = [];
 
@@ -2166,9 +3388,13 @@ p {
     spineItems.push(`<itemref idref="cover"/>`);
   }
 
-  // Include visual TOC in spine right after cover (or at front)
+  // Include visual TOC in spine right after cover (or at front) and contents.xhtml in manifest
   manifestItems.push(`<item id="toc-view" href="toc.xhtml" media-type="application/xhtml+xml"/>`);
+  manifestItems.push(`<item id="contents-view" href="contents.xhtml" media-type="application/xhtml+xml"/>`);
   spineItems.push(`<itemref idref="toc-view"/>`);
+
+  const emittedIdsByFile = new Map<string, Set<string>>();
+  const emittedHeadingsByFile = new Map<string, EmittedChapterHeadingInfo[]>();
 
   // Write each reconstructed chapter/section group
   layoutReconstruction.consolidatedGroups.forEach((group) => {
@@ -2198,15 +3424,18 @@ p {
       });
     }
 
-    let pageContent = markdownToXhtml(page.markdown, page.figures, {
+    const rawPageContent = markdownToXhtml(page.markdown, page.figures, {
       isPreview: false,
       pageNumber: page.pageNumber,
       isTocPage: false,
-      allPages: validPages,
+      allPages: layoutReconstruction.cleanedPages.length > 0 ? layoutReconstruction.cleanedPages : validPages,
+      skipPostNormalize: true,
+      layoutBlocks: page.layoutBlocks,
     });
 
-    const layoutNorm = normalizeEpubLayoutXhtml(pageContent);
-    pageContent = normalizeHtmlToXhtml(layoutNorm.normalizedXhtml);
+    const initialXhtml = normalizeHtmlToXhtml(rawPageContent);
+    const layoutNorm = normalizeEpubLayoutXhtml(initialXhtml);
+    const pageContent = normalizeHtmlToXhtml(layoutNorm.normalizedXhtml);
     layoutReport.emptyElementsRemoved += layoutNorm.emptyElementsRemoved;
     layoutReport.excessiveSpacingNormalized += layoutNorm.excessiveSpacingNormalized;
 
@@ -2239,6 +3468,10 @@ p {
       layoutReport.warnings.push(...layoutCheck.issues);
     }
 
+    const extractedInfo = extractEmittedIdsAndHeadings(xhtml);
+    emittedIdsByFile.set(filename, extractedInfo.ids);
+    emittedHeadingsByFile.set(filename, extractedInfo.headings);
+
     oebps.file(filename, xhtml);
     manifestItems.push(`<item id="${pageId}" href="${filename}" media-type="application/xhtml+xml"/>`);
     spineItems.push(`<itemref idref="${pageId}"/>`);
@@ -2251,6 +3484,44 @@ p {
   const firstContentHref = firstReadingGroup
     ? `page_${firstReadingGroup.sectionPage.pageNumber}.xhtml`
     : 'toc.xhtml';
+
+  // Synchronize TOC tree against the actual emitted XHTML chapter files and heading anchor IDs
+  const unresolvedSyncWarnings: string[] = [];
+  const tocTree = synchronizeTocTreeWithGeneratedChapters(
+    remappedTocTree,
+    emittedIdsByFile,
+    emittedHeadingsByFile,
+    firstContentHref,
+    unresolvedSyncWarnings
+  );
+  if (unresolvedSyncWarnings.length > 0) {
+    tocResult.diagnostics.warnings.push(...unresolvedSyncWarnings);
+    layoutReport.warnings.push(...unresolvedSyncWarnings);
+  }
+
+  // Build Canonical Document Outline from synchronized TOC tree and document metadata
+  const canonicalOutline = buildCanonicalDocumentOutline(
+    tocTree,
+    validPages,
+    bookDetails,
+    lang,
+    tocResult
+  );
+
+  // Generate Standalone Visual Table of Contents (toc.xhtml & contents.xhtml) from synchronized canonical outline
+  const visualTocContent = generateVisualTocHtml(tocTree, bookTitle, author, lang);
+  const normalizedVisualToc = normalizeHtmlToXhtml(visualTocContent);
+  const visualTocXhtml = buildCompleteXhtmlDocument(
+    `${tocTitle} - ${bookTitle}`,
+    normalizedVisualToc,
+    lang
+  );
+  const tocCheck = validateXmlString(visualTocXhtml);
+  if (!tocCheck.isValid) {
+    throw new Error(`toc.xhtml XML validation failed: ${tocCheck.error}`);
+  }
+  oebps.file('toc.xhtml', visualTocXhtml);
+  oebps.file('contents.xhtml', visualTocXhtml);
 
   // 1. Navigation document (nav.xhtml for EPUB 3 with nested <ol> and landmarks)
   function renderNavOl(nodes: EpubTocItem[], depth: number = 1): string {
@@ -2395,6 +3666,8 @@ p {
     diagnostics: tocResult.diagnostics,
     validationReport: packageValidation,
     layoutReport,
+    canonicalOutline,
   };
 }
+
 

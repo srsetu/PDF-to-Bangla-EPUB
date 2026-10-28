@@ -627,25 +627,53 @@ export async function validateEpubPackage(zip: JSZip): Promise<PackageValidation
     }
   }
 
-  // 5. Validate Navigation document links (nav.xhtml & toc.ncx)
-  const navFilePath = opfDir + 'nav.xhtml';
-  const navFile = zip.file(navFilePath);
-  if (navFile) {
-    const navContent = await navFile.async('text');
-    const linkRegex = /<a\s+[^>]*?href=["']([^"']+)["'][^>]*?>/gi;
-    let lMatch;
-    while ((lMatch = linkRegex.exec(navContent)) !== null) {
-      const href = lMatch[1];
-      const [fileName, anchor] = href.split('#');
+  // 5. Validate Navigation document links (nav.xhtml, toc.xhtml, contents.xhtml, & toc.ncx)
+  const navDocNames = ['nav.xhtml', 'toc.xhtml', 'contents.xhtml'];
+  for (const navDocName of navDocNames) {
+    const navFilePath = opfDir + navDocName;
+    const navFile = zip.file(navFilePath);
+    if (navFile) {
+      const navContent = await navFile.async('text');
+      const linkRegex = /<a\s+[^>]*?href=["']([^"']+)["'][^>]*?>/gi;
+      let lMatch;
+      while ((lMatch = linkRegex.exec(navContent)) !== null) {
+        const href = lMatch[1];
+        const [fileName, anchor] = href.split('#');
+        if (fileName) {
+          const fullTarget = opfDir + fileName;
+          if (!zip.file(fullTarget)) {
+            errors.push(`${navDocName} link target does not exist: "${href}"`);
+          } else if (anchor) {
+            const idsInTarget = fileElementIds.get(fileName);
+            if (idsInTarget && !idsInTarget.has(anchor)) {
+              warnings.push(
+                `${navDocName} link anchor "#${anchor}" not found in target file "${fileName}".`
+              );
+            }
+          }
+        }
+      }
+    }
+  }
+
+  const ncxFilePath = opfDir + 'toc.ncx';
+  const ncxFile = zip.file(ncxFilePath);
+  if (ncxFile) {
+    const ncxContent = await ncxFile.async('text');
+    const contentSrcRegex = /<content\s+[^>]*?src=["']([^"']+)["'][^>]*?\/>/gi;
+    let cMatch;
+    while ((cMatch = contentSrcRegex.exec(ncxContent)) !== null) {
+      const src = cMatch[1];
+      const [fileName, anchor] = src.split('#');
       if (fileName) {
         const fullTarget = opfDir + fileName;
         if (!zip.file(fullTarget)) {
-          errors.push(`nav.xhtml link target does not exist: "${href}"`);
+          errors.push(`toc.ncx content src target does not exist: "${src}"`);
         } else if (anchor) {
           const idsInTarget = fileElementIds.get(fileName);
           if (idsInTarget && !idsInTarget.has(anchor)) {
             warnings.push(
-              `nav.xhtml link anchor "#${anchor}" not found in target file "${fileName}".`
+              `toc.ncx content src anchor "#${anchor}" not found in target file "${fileName}".`
             );
           }
         }

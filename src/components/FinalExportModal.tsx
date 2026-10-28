@@ -13,6 +13,10 @@ import {
 } from '../utils/epubGenerator';
 import { extractAuthoritativeTocTree } from '../utils/tocExtractor';
 import {
+  reconstructDocumentLayoutForEpub,
+  remapTocTreeForConsolidatedPages,
+} from '../utils/epubLayoutPipeline';
+import {
   Download,
   BookOpen,
   Image as ImageIcon,
@@ -41,6 +45,8 @@ interface FinalExportModalProps {
   onSetCustomCover: (base64: string | null) => void;
   structureConfig?: StructureConfig;
   pdfOutline?: PdfOutlineItem[];
+  smartSpacing?: boolean;
+  onToggleSmartSpacing?: (enabled: boolean) => void;
 }
 
 export const FinalExportModal: React.FC<FinalExportModalProps> = ({
@@ -54,11 +60,25 @@ export const FinalExportModal: React.FC<FinalExportModalProps> = ({
   onSetCustomCover,
   structureConfig,
   pdfOutline,
+  smartSpacing = true,
+  onToggleSmartSpacing,
 }) => {
   const [bookDetails, setBookDetails] = useState<BookDetails>(initialBookDetails);
   const [coverSource, setCoverSource] = useState<'page' | 'upload'>('page');
   const [isExporting, setIsExporting] = useState(false);
   const [activeTab, setActiveTab] = useState<'meta' | 'reader'>('meta');
+  const [localSmartSpacing, setLocalSmartSpacing] = useState<boolean>(smartSpacing !== false);
+
+  React.useEffect(() => {
+    setLocalSmartSpacing(smartSpacing !== false);
+  }, [smartSpacing]);
+
+  const handleSmartSpacingChange = (enabled: boolean) => {
+    setLocalSmartSpacing(enabled);
+    if (onToggleSmartSpacing) {
+      onToggleSmartSpacing(enabled);
+    }
+  };
 
   // Synchronize bookDetails when modal opens or initialBookDetails changes
   React.useEffect(() => {
@@ -91,7 +111,38 @@ export const FinalExportModal: React.FC<FinalExportModalProps> = ({
     });
   }, [validPages, pdfOutline, structureConfig, bookDetails]);
 
-  const tocTree = tocExtraction.tree;
+  const previewLayoutReconstruction = React.useMemo(() => {
+    return reconstructDocumentLayoutForEpub(validPages, {
+      tocTree: tocExtraction.tree,
+      identifiedTocPageNums: new Set(tocExtraction.tocPages),
+      smartSpacing: localSmartSpacing,
+      bookDetails,
+      structureConfig,
+      pdfOutline,
+    });
+  }, [
+    validPages,
+    tocExtraction.tree,
+    tocExtraction.tocPages,
+    localSmartSpacing,
+    bookDetails,
+    structureConfig,
+    pdfOutline,
+  ]);
+
+  const readerPages = React.useMemo(() => {
+    if (!localSmartSpacing) return validPages;
+    return previewLayoutReconstruction.consolidatedGroups.map((g) => g.sectionPage);
+  }, [localSmartSpacing, validPages, previewLayoutReconstruction]);
+
+  const tocTree = React.useMemo(() => {
+    if (!localSmartSpacing) return tocExtraction.tree;
+    return remapTocTreeForConsolidatedPages(
+      tocExtraction.tree,
+      previewLayoutReconstruction.pageToSectionFileMap
+    );
+  }, [localSmartSpacing, tocExtraction.tree, previewLayoutReconstruction]);
+
   const tocDiagnostics = tocExtraction.diagnostics;
 
   if (!isOpen) return null;
@@ -129,7 +180,8 @@ export const FinalExportModal: React.FC<FinalExportModalProps> = ({
         currentCoverUrl,
         selectedFont,
         structureConfig,
-        pdfOutline
+        pdfOutline,
+        { smartSpacing: localSmartSpacing }
       );
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -153,7 +205,7 @@ export const FinalExportModal: React.FC<FinalExportModalProps> = ({
       return;
     }
 
-    const combinedMarkdown = validPages
+    const combinedMarkdown = readerPages
       .map(
         (p) =>
           `<!-- পৃষ্ঠা ${p.pageNumber} -->\n\n${correctBengaliMixedScriptText(p.markdown, {
@@ -172,7 +224,8 @@ export const FinalExportModal: React.FC<FinalExportModalProps> = ({
     URL.revokeObjectURL(url);
   };
 
-  const activeReaderPage = validPages[readerPageIndex] || validPages[0];
+  const safeReaderIndex = Math.min(readerPageIndex, Math.max(0, readerPages.length - 1));
+  const activeReaderPage = readerPages[safeReaderIndex] || readerPages[0];
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 backdrop-blur-xs p-2 sm:p-4 overflow-y-auto">
@@ -472,6 +525,43 @@ export const FinalExportModal: React.FC<FinalExportModalProps> = ({
                   </div>
                 </div>
 
+                {/* Smart Spacing Toggle (ON by default) */}
+                <div className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/50 flex items-center justify-between gap-3">
+                  <div className="space-y-0.5">
+                    <div className="text-xs font-bold text-slate-800 dark:text-slate-100 flex items-center gap-1.5">
+                      <Sparkles className="w-3.5 h-3.5 text-indigo-600 dark:text-indigo-400" />
+                      <span>স্মার্ট স্পেসিং (Smart Spacing)</span>
+                    </div>
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-tight">
+                      পিডিএফ পৃষ্ঠার কৃত্রিম গ্যাপ দূর করে এবং অধ্যায়, শিরোনাম ও কবিতার মূল কাঠামো বজায় রাখে
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-1 bg-slate-200/80 dark:bg-slate-900 p-0.5 rounded-lg text-[11px] font-bold flex-shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => handleSmartSpacingChange(true)}
+                      className={`px-2.5 py-1 rounded-md transition-all cursor-pointer ${
+                        localSmartSpacing
+                          ? 'bg-indigo-600 text-white shadow-2xs'
+                          : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+                      }`}
+                    >
+                      ON
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleSmartSpacingChange(false)}
+                      className={`px-2.5 py-1 rounded-md transition-all cursor-pointer ${
+                        !localSmartSpacing
+                          ? 'bg-slate-700 text-white shadow-2xs'
+                          : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+                      }`}
+                    >
+                      OFF
+                    </button>
+                  </div>
+                </div>
+
                 <div className="p-3 bg-indigo-50/70 dark:bg-indigo-950/40 border border-indigo-100 dark:border-indigo-800/70 rounded-xl text-xs text-indigo-950 dark:text-indigo-200 space-y-1">
                   <div className="font-bold flex items-center gap-1.5">
                     <Sparkles className="w-3.5 h-3.5 text-indigo-600 dark:text-indigo-400" />
@@ -479,6 +569,9 @@ export const FinalExportModal: React.FC<FinalExportModalProps> = ({
                   </div>
                   <div>
                     • মোট অন্তর্ভুক্ত পৃষ্ঠা: <strong>{validPages.length}</strong> টি।
+                  </div>
+                  <div>
+                    • স্মার্ট স্পেসিং: <strong>{localSmartSpacing ? 'চালু (ON) — কৃত্রিম পৃষ্ঠা-গ্যাপ অপসারণ সক্রিয়' : 'বন্ধ (OFF) — লিগ্যাসি পৃষ্ঠাভিত্তিক লেআউট'}</strong>।
                   </div>
                   <div>
                     • নির্বাচিত ফন্ট: <strong>{selectedFont === 'noto' ? 'নাতো সানস বাঙালি' : selectedFont === 'kalpurush' ? 'কালপুরুষ' : selectedFont === 'solaiman' ? 'সুলাইমানলিপি' : 'হিন্দ সিলিগুড়ি'}</strong>।
@@ -525,15 +618,15 @@ export const FinalExportModal: React.FC<FinalExportModalProps> = ({
                   <span className="font-semibold text-slate-700 dark:text-slate-200">
                     {isViewingToc
                       ? `${tocTitle} (ইপাব সূচিপত্র প্রিভিউ)`
-                      : `অধ্যায় / পাতা ${readerPageIndex + 1} / ${validPages.length} (পৃষ্ঠা ${activeReaderPage?.pageNumber})`}
+                      : `অধ্যায় / পাতা ${safeReaderIndex + 1} / ${readerPages.length} (পৃষ্ঠা ${activeReaderPage?.pageNumber})`}
                   </span>
                   <button
                     type="button"
                     onClick={() => {
                       setIsViewingToc(false);
-                      setReaderPageIndex((i) => Math.min(validPages.length - 1, i + 1));
+                      setReaderPageIndex((i) => Math.min(readerPages.length - 1, i + 1));
                     }}
-                    disabled={isViewingToc || readerPageIndex >= validPages.length - 1}
+                    disabled={isViewingToc || safeReaderIndex >= readerPages.length - 1}
                     className="p-1.5 rounded bg-white dark:bg-slate-700 text-slate-800 dark:text-slate-200 shadow-2xs disabled:opacity-40"
                   >
                     <ChevronRight className="w-4 h-4" />
@@ -645,7 +738,11 @@ export const FinalExportModal: React.FC<FinalExportModalProps> = ({
 
                   if (targetPageNum !== null) {
                     e.preventDefault();
-                    const targetIdx = validPages.findIndex((p) => p.pageNumber === targetPageNum);
+                    const mappedTarget = localSmartSpacing
+                      ? previewLayoutReconstruction.pageToSectionFileMap.get(targetPageNum)?.sectionPageNumber ??
+                        targetPageNum
+                      : targetPageNum;
+                    const targetIdx = readerPages.findIndex((p) => p.pageNumber === mappedTarget);
                     if (targetIdx !== -1) {
                       setIsViewingToc(false);
                       setReaderPageIndex(targetIdx);
@@ -699,7 +796,8 @@ export const FinalExportModal: React.FC<FinalExportModalProps> = ({
                         isPreview: true,
                         pageNumber: activeReaderPage.pageNumber,
                         isTocPage: isLikelyTocPage(activeReaderPage, validPages),
-                        allPages: validPages,
+                        allPages: readerPages,
+                        smartSpacing: localSmartSpacing,
                       }),
                     }}
                   />

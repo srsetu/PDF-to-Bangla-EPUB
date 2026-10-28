@@ -194,12 +194,13 @@ export default function App() {
     trimMarginArtifacts: true,
   });
 
-  // Conversion Settings (AI Model, Language, Batch, Mode)
+  // Conversion Settings (AI Model, Language, Batch, Mode, Smart Spacing)
   const [conversionSettings, setConversionSettings] = useState<ConversionSettings>({
     model: 'LTGB',
     language: 'bn',
     batchSize: 2,
     mode: 'smart',
+    smartSpacing: true,
   });
 
   // Processing State & Monitor
@@ -378,7 +379,10 @@ export default function App() {
 
       const totalPages = loaded.numPages;
       const initialPages: PageItem[] = new Array(totalPages);
-      const chunkSize = 3;
+      const chunkSize =
+        typeof navigator !== 'undefined' && navigator.hardwareConcurrency
+          ? Math.min(6, Math.max(3, Math.floor(navigator.hardwareConcurrency / 2)))
+          : 4;
 
       for (let i = 1; i <= totalPages; i += chunkSize) {
         const batchPages = Array.from(
@@ -576,8 +580,13 @@ export default function App() {
       let figuresWithImages: any[] = [];
 
       // In smart mode or image mode, extract images with strict precision:
-      // Direct embedded PDF object extraction first, precision boundary detection fallback
-      if (currentMode !== 'text') {
+      // Direct embedded PDF object extraction first, precision boundary detection fallback.
+      // Skip PDF operator list parsing on pure-text pages where hasImages is known false and OCR found no figures.
+      const shouldExtractImages =
+        currentMode !== 'text' &&
+        (page.hasImages !== false || (Array.isArray(data.figures) && data.figures.length > 0));
+
+      if (shouldExtractImages) {
         try {
           figuresWithImages = await extractStrictPageImages(
             pdfDocRef.current,
@@ -612,10 +621,12 @@ export default function App() {
       }
 
       const rawOcrText = data.rawOcr ?? data.markdown ?? '';
-      const clientValidation = validateAndCorrectBengaliOcr(data.markdown || '', {
-        language: conversionSettings.language,
-        bookDetails,
-      });
+      const clientValidation = data.ocrValidation
+        ? { correctedText: data.markdown || '', validationReport: data.ocrValidation as OcrValidationReport }
+        : validateAndCorrectBengaliOcr(data.markdown || '', {
+            language: conversionSettings.language,
+            bookDetails,
+          });
 
       const finalValidation: OcrValidationReport = data.ocrValidation || clientValidation.validationReport;
 
@@ -1644,6 +1655,10 @@ export default function App() {
         onSetCustomCover={setCustomCoverBase64}
         structureConfig={structureConfig}
         pdfOutline={pdfOutline}
+        smartSpacing={conversionSettings.smartSpacing !== false}
+        onToggleSmartSpacing={(enabled) =>
+          setConversionSettings((prev) => ({ ...prev, smartSpacing: enabled }))
+        }
       />
 
       {/* Multi-Account Gemini API Key Pool Modal */}

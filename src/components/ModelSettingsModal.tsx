@@ -282,6 +282,50 @@ export const ModelSettingsModal: React.FC<ModelSettingsModalProps> = ({
               </button>
             </div>
           </div>
+
+          {/* 5. Smart Spacing (ON / OFF) */}
+          <div className="border-t border-slate-200 dark:border-slate-800 pt-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3.5 rounded-xl border border-indigo-200 dark:border-indigo-800/80 bg-indigo-50/50 dark:bg-indigo-950/30">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <Sparkles className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
+                  <span className="text-xs sm:text-sm font-bold text-slate-900 dark:text-white">
+                    ৫. স্মার্ট স্পেসিং (Smart Spacing)
+                  </span>
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-indigo-600 text-white">
+                    {current.smartSpacing !== false ? 'চালু (ON)' : 'বন্ধ (OFF)'}
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-600 dark:text-slate-300 leading-snug">
+                  পিডিএফ পৃষ্ঠার কৃত্রিম গ্যাপ ও বিচ্ছিন্ন বাক্য স্বয়ংক্রিয়ভাবে যুক্ত করে এবং অধ্যায়, শিরোনাম, কবিতা ও অনুচ্ছেদের আসল ব্যবধান অক্ষুণ্ণ রাখে।
+                </p>
+              </div>
+              <div className="flex items-center gap-1.5 flex-shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setCurrent({ ...current, smartSpacing: true })}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                    current.smartSpacing !== false
+                      ? 'bg-indigo-600 text-white shadow-2xs'
+                      : 'bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  ON (চালু)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCurrent({ ...current, smartSpacing: false })}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                    current.smartSpacing === false
+                      ? 'bg-slate-700 text-white shadow-2xs'
+                      : 'bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  OFF (বন্ধ)
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
 
         {/* Footer */}

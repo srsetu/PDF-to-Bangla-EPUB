@@ -1,6 +1,11 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { PageItem, ProcessingState, ConversionSettings, ExtractionMode } from '../types';
 import { markdownToXhtml, isTableOfContentsText, isLikelyTocPage } from '../utils/epubGenerator';
+import {
+  splitMarkdownIntoLogicalBlocks,
+  evaluateParagraphContinuation,
+  detectAndStripRunningHeadersFooters,
+} from '../utils/epubLayoutPipeline';
 import { validateAndCorrectBengaliOcr } from '../utils/bengaliOcrPipeline';
 import { formatFriendlyErrorMessage } from '../utils/errorHelper';
 import { formatElapsedTime, formatBengaliDuration } from '../utils/timeHelper';
@@ -228,8 +233,79 @@ export const RightEditorPanel: React.FC<RightEditorPanelProps> = ({
     setTimeout(() => setCopied(false), 2000);
   };
 
+  // Reconstruct cross-page paragraph continuation for live EPUB preview when Smart Spacing is enabled
+  const previewMarkdown = React.useMemo(() => {
+    if (!markdown || conversionSettings.smartSpacing === false) return markdown;
+    if (isLikelyTocPage(currentPage, pages)) return markdown;
+
+    const { cleanedPages } = detectAndStripRunningHeadersFooters(pages);
+    const currCleaned =
+      cleanedPages.find((p) => p.pageNumber === currentPage.pageNumber)?.markdown || markdown;
+    const currBlocks = splitMarkdownIntoLogicalBlocks(currCleaned);
+    if (currBlocks.length === 0) return markdown;
+
+    // Check if previous completed non-excluded page's last block continues into currentPage's first block
+    const prevPage = [...cleanedPages]
+      .reverse()
+      .find(
+        (p) =>
+          p.pageNumber < currentPage.pageNumber &&
+          p.status !== 'excluded' &&
+          p.markdown &&
+          p.markdown.trim().length > 0 &&
+          !isLikelyTocPage(p, pages)
+      );
+    if (prevPage && prevPage.markdown) {
+      const prevBlocks = splitMarkdownIntoLogicalBlocks(prevPage.markdown);
+      const lastPrevBlock = prevBlocks[prevBlocks.length - 1];
+      if (lastPrevBlock && currBlocks[0]) {
+        const evalPrev = evaluateParagraphContinuation(lastPrevBlock, currBlocks[0], {
+          isPageBoundary: true,
+          nextPageIsChapterStart: false,
+          prevPageBlocks: prevBlocks,
+          nextPageBlocks: currBlocks,
+          prevPageLayoutBlocks: prevPage.layoutBlocks,
+          nextPageLayoutBlocks: currentPage.layoutBlocks,
+        });
+        if (evalPrev.shouldMerge && evalPrev.mergedText) {
+          currBlocks[0] = evalPrev.mergedText;
+        }
+      }
+    }
+
+    // Check if currentPage's last block continues onto next completed non-excluded page's first block
+    const nextPage = cleanedPages.find(
+      (p) =>
+        p.pageNumber > currentPage.pageNumber &&
+        p.status !== 'excluded' &&
+        p.markdown &&
+        p.markdown.trim().length > 0 &&
+        !isLikelyTocPage(p, pages)
+    );
+    if (nextPage && nextPage.markdown) {
+      const nextBlocks = splitMarkdownIntoLogicalBlocks(nextPage.markdown);
+      const firstNextBlock = nextBlocks[0];
+      const lastCurrIdx = currBlocks.length - 1;
+      if (currBlocks[lastCurrIdx] && firstNextBlock) {
+        const evalNext = evaluateParagraphContinuation(currBlocks[lastCurrIdx], firstNextBlock, {
+          isPageBoundary: true,
+          nextPageIsChapterStart: false,
+          prevPageBlocks: currBlocks,
+          nextPageBlocks: nextBlocks,
+          prevPageLayoutBlocks: currentPage.layoutBlocks,
+          nextPageLayoutBlocks: nextPage.layoutBlocks,
+        });
+        if (evalNext.shouldMerge && evalNext.mergedText) {
+          currBlocks[lastCurrIdx] = evalNext.mergedText;
+        }
+      }
+    }
+
+    return currBlocks.join('\n\n');
+  }, [markdown, currentPage, pages, conversionSettings.smartSpacing]);
+
   // Convert markdown to preview HTML with actual figure image resolution and interactive TOC links
-  const previewHtml = markdownToXhtml(markdown, currentPage.figures || [], {
+  const previewHtml = markdownToXhtml(previewMarkdown, currentPage.figures || [], {
     isPreview: true,
     pageNumber: currentPage.pageNumber,
     isTocPage: isLikelyTocPage(currentPage, pages),

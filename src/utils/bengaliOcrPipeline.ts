@@ -880,6 +880,16 @@ function analyzeAndCorrectSubToken(
  * - Ambiguous character substitutions (e.g. 'কxবা', 'মনোxqযোগ')
  * - Orphaned dependent vowel signs with missing base consonants (e.g. 'িংবা')
  */
+const MAX_OCR_VALIDATION_CACHE_SIZE = 500;
+const ocrValidationCache = new Map<
+  string,
+  {
+    correctedText: string;
+    rawText: string;
+    validationReport: OcrValidationReport;
+  }
+>();
+
 export function validateAndCorrectBengaliOcr(
   rawText: string,
   options?: {
@@ -891,13 +901,12 @@ export function validateAndCorrectBengaliOcr(
   rawText: string;
   validationReport: OcrValidationReport;
 } {
-  const langProfile = detectPrimaryScriptAndLanguage(
-    rawText || '',
-    options?.bookDetails,
-    options?.language
-  );
-
   if (!rawText) {
+    const langProfile = detectPrimaryScriptAndLanguage(
+      '',
+      options?.bookDetails,
+      options?.language
+    );
     return {
       correctedText: '',
       rawText: '',
@@ -909,6 +918,18 @@ export function validateAndCorrectBengaliOcr(
       },
     };
   }
+
+  const cacheKey = `${options?.language || ''}|${options?.bookDetails?.language || ''}|${options?.bookDetails?.title || ''}|${options?.bookDetails?.author || ''}|${rawText}`;
+  const cached = ocrValidationCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  const langProfile = detectPrimaryScriptAndLanguage(
+    rawText,
+    options?.bookDetails,
+    options?.language
+  );
 
   const correctionsApplied: OcrCorrectionEntry[] = [];
   const flaggedTokens: OcrFlaggedToken[] = [];
@@ -1052,7 +1073,7 @@ export function validateAndCorrectBengaliOcr(
 
   const correctedText = processedLines.join('\n');
 
-  return {
+  const result = {
     correctedText,
     rawText,
     validationReport: {
@@ -1062,6 +1083,16 @@ export function validateAndCorrectBengaliOcr(
       hasSuspiciousTokens: flaggedTokens.length > 0,
     },
   };
+
+  if (ocrValidationCache.size >= MAX_OCR_VALIDATION_CACHE_SIZE) {
+    const oldestKey = ocrValidationCache.keys().next().value;
+    if (oldestKey !== undefined) {
+      ocrValidationCache.delete(oldestKey);
+    }
+  }
+  ocrValidationCache.set(cacheKey, result);
+
+  return result;
 }
 
 /**

@@ -831,10 +831,12 @@ ${languageModeInstruction}
 
     const rawMarkdown = response?.text || '';
 
-    // Strip any trailing caption lines beneath figure tags (e.g. *ক্যাপশন*, *চিত্র ১*, etc.)
-    const strippedCaptionsMarkdown = rawMarkdown
-      .replace(/(\[IMAGE_FIGURE:\s*{[\s\S]*?}\])\s*\n\s*\*(?:চিত্র|ছবি|ক্যাপশন|চিত্রাঙ্কন|ডায়াগ্রাম)?[^*]+\*/gi, '$1')
-      .replace(/(\[IMAGE_FIGURE:\s*{[\s\S]*?}\])\s*\n\s*(?:চিত্র|ছবি|চিত্রাঙ্কন|ডায়াগ্রাম)\s*[:।-][^\n]+/gi, '$1');
+    // Strip only standalone generic placeholder labels beneath figure tags (e.g. "চিত্র", "*চিত্র*", "[চিত্র]", "*ক্যাপশন*")
+    // while preserving genuine source captions such as "চিত্র ১: মুঘল স্থাপত্য"
+    const strippedCaptionsMarkdown = rawMarkdown.replace(
+      /(\[IMAGE_FIGURE:\s*{[\s\S]*?}\])\s*\n\s*(?:\*+|_+|\s+|\[+|\()*(?:চিত্র|ছবি|ক্যাপশন|চিত্রাঙ্কন|ডায়াগ্রাম|ডায়াগ্রাম|অলঙ্করণ|figure|image|illustration|diagram|photo|caption)(?:\*+|_+|\s+|\]+|\)|[:।.\-–—])*(?=\r?\n|$)/gi,
+      '$1'
+    );
 
     // Strip all printed page numbers from top or bottom of the page
     const rawOcr = stripPrintedPageNumbers(strippedCaptionsMarkdown);
@@ -986,8 +988,15 @@ ${languageModeInstruction}
             alignVal = 'center';
           }
 
+          const rawFigCaption = typeof parsed.caption === 'string' ? parsed.caption.trim() : '';
+          const isGenericPlaceholder =
+            !rawFigCaption ||
+            /^(?:\*+|_+|\s+|\[+|\()*(?:চিত্র|ছবি|ক্যাপশন|চিত্রাঙ্কন|ডায়াগ্রাম|ডায়াগ্রাম|অলঙ্করণ|লোগো|আইকন|প্রতিকৃতি|figure|image|illustration|diagram|photo|caption)(?:\*+|_+|\s+|\]+|\)|[:।.\-–—])*$/i.test(
+              rawFigCaption
+            );
+
           figures.push({
-            caption: 'চিত্র',
+            caption: isGenericPlaceholder ? '' : rawFigCaption,
             type: parsed.type || 'figure',
             top: isNaN(topVal) ? 20 : topVal,
             left: isNaN(leftVal) ? 10 : leftVal,
@@ -1166,8 +1175,8 @@ async function startServer() {
     });
   }
 
-  app.listen(port, () => {
-    console.log(`Bangla PDF to EPUB server running at http://localhost:${port}`);
+  app.listen(Number(port), '0.0.0.0', () => {
+    console.log(`Bangla PDF to EPUB server running at http://0.0.0.0:${port}`);
   });
 }
 
